@@ -1,0 +1,18 @@
+[package]
+name = "finance-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "FFI layer for Swift / React Native integration"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+finance-core = { path = "../finance-core" }
+finance-storage = { path = "../finance-storage" }
+finance-sync = { path = "../finance-sync" }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+once_cell = "1.19"

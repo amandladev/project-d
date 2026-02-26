@@ -1,0 +1,13 @@
+[package]
+name = "finance-storage"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite persistence layer for personal finance backend"
+
+[dependencies]
+finance-core = { path = "../finance-core" }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "finance-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure domain layer for personal finance backend"
+
+[dependencies]
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
