@@ -1,9 +1,13 @@
 pub mod sqlite_account_repository;
+pub mod sqlite_budget_repository;
 pub mod sqlite_category_repository;
+pub mod sqlite_recurring_transaction_repository;
 pub mod sqlite_transaction_repository;
 pub mod sqlite_user_repository;
 
 pub use sqlite_account_repository::SqliteAccountRepository;
+pub use sqlite_budget_repository::SqliteBudgetRepository;
 pub use sqlite_category_repository::SqliteCategoryRepository;
+pub use sqlite_recurring_transaction_repository::SqliteRecurringTransactionRepository;
 pub use sqlite_transaction_repository::SqliteTransactionRepository;
 pub use sqlite_user_repository::SqliteUserRepository;

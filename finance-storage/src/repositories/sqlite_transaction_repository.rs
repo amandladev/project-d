@@ -6,8 +6,10 @@ use finance_core::entities::common::{BaseEntity, SyncStatus, TransactionType};
 use finance_core::entities::Transaction;
 use finance_core::errors::DomainError;
 use finance_core::repositories::TransactionRepository;
+use finance_core::use_cases::statistics_use_cases::CategorySpending;
 
 use crate::database::Database;
+use crate::date_utils::{format_dt, format_dt_opt};
 use crate::error::StorageError;
 
 /// SQLite implementation of TransactionRepository.
@@ -34,12 +36,12 @@ impl<'a> TransactionRepository for SqliteTransactionRepository<'a> {
                 transaction.amount,
                 transaction.transaction_type.to_string(),
                 transaction.description,
-                transaction.date.to_rfc3339(),
+                format_dt(&transaction.date),
                 transaction.sync_status.to_string(),
                 transaction.version,
-                transaction.base.created_at.to_rfc3339(),
-                transaction.base.updated_at.to_rfc3339(),
-                transaction.base.deleted_at.map(|d| d.to_rfc3339()),
+                format_dt(&transaction.base.created_at),
+                format_dt(&transaction.base.updated_at),
+                format_dt_opt(&transaction.base.deleted_at),
             ],
         ).map_err(StorageError::from)?;
         Ok(())
@@ -105,8 +107,8 @@ impl<'a> TransactionRepository for SqliteTransactionRepository<'a> {
             .query_map(
                 params![
                     account_id.to_string(),
-                    from.to_rfc3339(),
-                    to.to_rfc3339()
+                    format_dt(&from),
+                    format_dt(&to)
                 ],
                 |row| row_to_transaction(row),
             )
@@ -129,11 +131,11 @@ impl<'a> TransactionRepository for SqliteTransactionRepository<'a> {
                 transaction.amount,
                 transaction.transaction_type.to_string(),
                 transaction.description,
-                transaction.date.to_rfc3339(),
+                format_dt(&transaction.date),
                 transaction.sync_status.to_string(),
                 transaction.version,
-                transaction.base.updated_at.to_rfc3339(),
-                transaction.base.deleted_at.map(|d| d.to_rfc3339()),
+                format_dt(&transaction.base.updated_at),
+                format_dt_opt(&transaction.base.deleted_at),
                 transaction.base.id.to_string(),
             ],
         ).map_err(StorageError::from)?;
@@ -142,7 +144,7 @@ impl<'a> TransactionRepository for SqliteTransactionRepository<'a> {
 
     fn delete(&self, id: Uuid) -> Result<(), DomainError> {
         let conn = self.db.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+        let now = format_dt(&Utc::now());
         conn.execute(
             "UPDATE transactions SET deleted_at = ?1, updated_at = ?1, sync_status = 'pending' WHERE id = ?2",
             params![now, id.to_string()],
@@ -188,6 +190,59 @@ impl<'a> TransactionRepository for SqliteTransactionRepository<'a> {
             .map_err(StorageError::from)?;
 
         Ok(balance)
+    }
+
+    fn get_spending_by_category(
+        &self,
+        account_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<CategorySpending>, DomainError> {
+        let conn = self.db.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.name, SUM(t.amount) as total, COUNT(t.id) as count
+                 FROM transactions t
+                 INNER JOIN categories c ON t.category_id = c.id
+                 WHERE t.account_id = ?1
+                   AND t.date >= ?2
+                   AND t.date <= ?3
+                   AND t.deleted_at IS NULL
+                   AND c.deleted_at IS NULL
+                   AND t.transaction_type = 'expense'
+                 GROUP BY c.id, c.name
+                 ORDER BY total DESC",
+            )
+            .map_err(StorageError::from)?;
+
+        let rows = stmt
+            .query_map(
+                params![
+                    account_id.to_string(),
+                    format_dt(&from),
+                    format_dt(&to)
+                ],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let total: i64 = row.get(2)?;
+                    let count: i64 = row.get(3)?;
+
+                    Ok(CategorySpending {
+                        category_id: Uuid::parse_str(&id_str).unwrap(),
+                        category_name: name,
+                        total_amount: total,
+                        transaction_count: count as usize,
+                    })
+                },
+            )
+            .map_err(StorageError::from)?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(StorageError::from)?);
+        }
+        Ok(result)
     }
 }
 

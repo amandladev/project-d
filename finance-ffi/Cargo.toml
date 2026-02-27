@@ -16,3 +16,6 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 once_cell = "1.19"
+
+[build-dependencies]
+cbindgen = "0.27"

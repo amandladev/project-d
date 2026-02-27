@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::entities::Transaction;
 use crate::errors::DomainError;
+use crate::use_cases::statistics_use_cases::CategorySpending;
 
 /// Repository trait for Transaction persistence.
 pub trait TransactionRepository: Send + Sync {
@@ -19,4 +20,10 @@ pub trait TransactionRepository: Send + Sync {
     fn delete(&self, id: Uuid) -> Result<(), DomainError>;
     fn find_pending_sync(&self) -> Result<Vec<Transaction>, DomainError>;
     fn calculate_balance(&self, account_id: Uuid) -> Result<i64, DomainError>;
+    fn get_spending_by_category(
+        &self,
+        account_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<CategorySpending>, DomainError>;
 }

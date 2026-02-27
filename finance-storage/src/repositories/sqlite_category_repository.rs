@@ -8,6 +8,7 @@ use finance_core::errors::DomainError;
 use finance_core::repositories::CategoryRepository;
 
 use crate::database::Database;
+use crate::date_utils::{format_dt, format_dt_opt};
 use crate::error::StorageError;
 
 /// SQLite implementation of CategoryRepository.
@@ -34,9 +35,9 @@ impl<'a> CategoryRepository for SqliteCategoryRepository<'a> {
                 category.icon,
                 category.sync_status.to_string(),
                 category.version,
-                category.base.created_at.to_rfc3339(),
-                category.base.updated_at.to_rfc3339(),
-                category.base.deleted_at.map(|d| d.to_rfc3339()),
+                format_dt(&category.base.created_at),
+                format_dt(&category.base.updated_at),
+                format_dt_opt(&category.base.deleted_at),
             ],
         ).map_err(StorageError::from)?;
         Ok(())
@@ -89,8 +90,8 @@ impl<'a> CategoryRepository for SqliteCategoryRepository<'a> {
                 category.icon,
                 category.sync_status.to_string(),
                 category.version,
-                category.base.updated_at.to_rfc3339(),
-                category.base.deleted_at.map(|d| d.to_rfc3339()),
+                format_dt(&category.base.updated_at),
+                format_dt_opt(&category.base.deleted_at),
                 category.base.id.to_string(),
             ],
         ).map_err(StorageError::from)?;
@@ -99,7 +100,7 @@ impl<'a> CategoryRepository for SqliteCategoryRepository<'a> {
 
     fn delete(&self, id: Uuid) -> Result<(), DomainError> {
         let conn = self.db.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+        let now = format_dt(&Utc::now());
         conn.execute(
             "UPDATE categories SET deleted_at = ?1, updated_at = ?1, sync_status = 'pending' WHERE id = ?2",
             params![now, id.to_string()],

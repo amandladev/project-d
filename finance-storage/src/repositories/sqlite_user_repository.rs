@@ -8,6 +8,7 @@ use finance_core::errors::DomainError;
 use finance_core::repositories::UserRepository;
 
 use crate::database::Database;
+use crate::date_utils::{format_dt, format_dt_opt};
 use crate::error::StorageError;
 
 /// SQLite implementation of UserRepository.
@@ -30,9 +31,9 @@ impl<'a> UserRepository for SqliteUserRepository<'a> {
                 user.base.id.to_string(),
                 user.name,
                 user.email,
-                user.base.created_at.to_rfc3339(),
-                user.base.updated_at.to_rfc3339(),
-                user.base.deleted_at.map(|d| d.to_rfc3339()),
+                format_dt(&user.base.created_at),
+                format_dt(&user.base.updated_at),
+                format_dt_opt(&user.base.deleted_at),
             ],
         ).map_err(StorageError::from)?;
         Ok(())
@@ -88,8 +89,8 @@ impl<'a> UserRepository for SqliteUserRepository<'a> {
             params![
                 user.name,
                 user.email,
-                user.base.updated_at.to_rfc3339(),
-                user.base.deleted_at.map(|d| d.to_rfc3339()),
+                format_dt(&user.base.updated_at),
+                format_dt_opt(&user.base.deleted_at),
                 user.base.id.to_string(),
             ],
         ).map_err(StorageError::from)?;
@@ -98,7 +99,7 @@ impl<'a> UserRepository for SqliteUserRepository<'a> {
 
     fn delete(&self, id: Uuid) -> Result<(), DomainError> {
         let conn = self.db.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+        let now = format_dt(&Utc::now());
         conn.execute(
             "UPDATE users SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
             params![now, id.to_string()],

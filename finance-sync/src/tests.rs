@@ -1,10 +1,11 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use finance_core::entities::common::{SyncStatus, TransactionType};
 use finance_core::entities::{Account, Category, Transaction};
 use finance_core::errors::DomainError;
 use finance_core::repositories::{AccountRepository, CategoryRepository, TransactionRepository};
+use finance_core::use_cases::CategorySpending;
 
 use crate::{SyncEngine, SyncError, SyncPayload, SyncResponse, SyncTransport, ServerChange};
 
@@ -288,6 +289,16 @@ impl TransactionRepository for InMemoryTransactionRepository {
             .filter(|t| t.account_id == account_id && !t.base.is_deleted())
             .map(|t| t.balance_effect())
             .sum())
+    }
+
+    fn get_spending_by_category(
+        &self,
+        _account_id: Uuid,
+        _from: DateTime<Utc>,
+        _to: DateTime<Utc>,
+    ) -> Result<Vec<CategorySpending>, DomainError> {
+        // Mock implementation - not needed for sync tests
+        Ok(Vec::new())
     }
 }
 

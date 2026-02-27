@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use uuid::Uuid;
 
     use finance_core::entities::{Account, Category, TransactionType, User};
     use finance_core::repositories::{
         AccountRepository, CategoryRepository, TransactionRepository, UserRepository,
     };
-    use finance_core::use_cases::{AccountUseCases, CategoryUseCases, TransactionUseCases};
+    use finance_core::use_cases::{AccountUseCases, CategoryUseCases, StatisticsUseCases, TransactionUseCases};
     use finance_storage::database::Database;
     use finance_storage::repositories::{
         SqliteAccountRepository, SqliteCategoryRepository, SqliteTransactionRepository,
@@ -419,5 +419,167 @@ mod tests {
 
         let pending = use_cases.get_pending_sync().unwrap();
         assert_eq!(pending.len(), 1);
+    }
+
+    // ─── Statistics Tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_income_vs_expenses_date_range() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+        let start = now - Duration::days(30);
+        let end = now + Duration::days(1);
+
+        // Create income
+        tx_use_cases
+            .create_transaction(
+                account.id(),
+                category.id(),
+                500_00,
+                TransactionType::Income,
+                "Salary".to_string(),
+                now,
+            )
+            .unwrap();
+
+        // Create expense
+        tx_use_cases
+            .create_transaction(
+                account.id(),
+                category.id(),
+                200_00,
+                TransactionType::Expense,
+                "Groceries".to_string(),
+                now,
+            )
+            .unwrap();
+
+        // Create a transfer (should not count as income or expense)
+        tx_use_cases
+            .create_transaction(
+                account.id(),
+                category.id(),
+                100_00,
+                TransactionType::Transfer,
+                "Move to savings".to_string(),
+                now,
+            )
+            .unwrap();
+
+        let stats_use_cases = StatisticsUseCases::new(&repo);
+        let summary = stats_use_cases
+            .get_income_vs_expenses(account.id(), start, end)
+            .unwrap();
+
+        assert_eq!(summary.income, 500_00);
+        assert_eq!(summary.expenses, 200_00);
+        assert_eq!(summary.transfers, 100_00);
+        assert_eq!(summary.net, 200_00); // income - expenses - transfers
+    }
+
+    #[test]
+    fn test_spending_by_category() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+
+        let cat_repo = SqliteCategoryRepository::new(&db);
+        let cat_use_cases = CategoryUseCases::new(&cat_repo);
+        let food = cat_use_cases
+            .create_category(user.id(), "Food".to_string(), Some("🍕".to_string()))
+            .unwrap();
+        let transport = cat_use_cases
+            .create_category(user.id(), "Transport".to_string(), Some("🚗".to_string()))
+            .unwrap();
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+        let start = now - Duration::days(30);
+        let end = now + Duration::days(1);
+
+        // Two food expenses
+        tx_use_cases
+            .create_transaction(
+                account.id(), food.id(), 150_00,
+                TransactionType::Expense, "Lunch".to_string(), now,
+            )
+            .unwrap();
+        tx_use_cases
+            .create_transaction(
+                account.id(), food.id(), 80_00,
+                TransactionType::Expense, "Dinner".to_string(), now,
+            )
+            .unwrap();
+
+        // One transport expense
+        tx_use_cases
+            .create_transaction(
+                account.id(), transport.id(), 50_00,
+                TransactionType::Expense, "Uber".to_string(), now,
+            )
+            .unwrap();
+
+        let stats = StatisticsUseCases::new(&repo);
+        let spending = stats
+            .get_spending_by_category(account.id(), start, end)
+            .unwrap();
+
+        assert_eq!(spending.len(), 2);
+
+        let food_spend = spending.iter().find(|s| s.category_id == food.id()).unwrap();
+        assert_eq!(food_spend.total_amount, 230_00);
+        assert_eq!(food_spend.transaction_count, 2);
+
+        let transport_spend = spending.iter().find(|s| s.category_id == transport.id()).unwrap();
+        assert_eq!(transport_spend.total_amount, 50_00);
+        assert_eq!(transport_spend.transaction_count, 1);
+    }
+
+    #[test]
+    fn test_income_vs_expenses_excludes_out_of_range() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+
+        // Transaction inside range
+        tx_use_cases
+            .create_transaction(
+                account.id(), category.id(), 100_00,
+                TransactionType::Income, "In range".to_string(), now,
+            )
+            .unwrap();
+
+        // Transaction outside range (60 days ago)
+        tx_use_cases
+            .create_transaction(
+                account.id(), category.id(), 999_00,
+                TransactionType::Income, "Out of range".to_string(),
+                now - Duration::days(60),
+            )
+            .unwrap();
+
+        // Query only last 30 days
+        let stats = StatisticsUseCases::new(&repo);
+        let summary = stats
+            .get_income_vs_expenses(account.id(), now - Duration::days(30), now + Duration::days(1))
+            .unwrap();
+
+        assert_eq!(summary.income, 100_00);
+        assert_eq!(summary.expenses, 0);
     }
 }
