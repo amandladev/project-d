@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use finance_core::entities::common::{BaseEntity, SyncStatus, TransactionType};
 use finance_core::entities::Transaction;
+use finance_core::entities::search::TransactionSearchFilter;
 use finance_core::errors::DomainError;
 use finance_core::repositories::TransactionRepository;
 use finance_core::use_cases::statistics_use_cases::CategorySpending;
@@ -243,6 +244,91 @@ impl<'a> TransactionRepository for SqliteTransactionRepository<'a> {
             result.push(row.map_err(StorageError::from)?);
         }
         Ok(result)
+    }
+
+    fn search(
+        &self,
+        filter: &TransactionSearchFilter,
+    ) -> Result<Vec<Transaction>, DomainError> {
+        let conn = self.db.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            "SELECT id, account_id, category_id, amount, transaction_type, description, date, sync_status, version, created_at, updated_at, deleted_at
+             FROM transactions
+             WHERE account_id = ?1 AND deleted_at IS NULL",
+        );
+        let mut param_idx = 2u32;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(filter.account_id.to_string())];
+
+        if let Some(ref query) = filter.query {
+            sql.push_str(&format!(" AND description LIKE ?{param_idx}"));
+            params_vec.push(Box::new(format!("%{query}%")));
+            param_idx += 1;
+        }
+
+        if let Some(category_id) = filter.category_id {
+            sql.push_str(&format!(" AND category_id = ?{param_idx}"));
+            params_vec.push(Box::new(category_id.to_string()));
+            param_idx += 1;
+        }
+
+        if let Some(tx_type) = filter.transaction_type {
+            sql.push_str(&format!(" AND transaction_type = ?{param_idx}"));
+            params_vec.push(Box::new(tx_type.to_string()));
+            param_idx += 1;
+        }
+
+        if let Some(min_amount) = filter.min_amount {
+            sql.push_str(&format!(" AND amount >= ?{param_idx}"));
+            params_vec.push(Box::new(min_amount));
+            param_idx += 1;
+        }
+
+        if let Some(max_amount) = filter.max_amount {
+            sql.push_str(&format!(" AND amount <= ?{param_idx}"));
+            params_vec.push(Box::new(max_amount));
+            param_idx += 1;
+        }
+
+        if let Some(date_from) = filter.date_from {
+            sql.push_str(&format!(" AND date >= ?{param_idx}"));
+            params_vec.push(Box::new(format_dt(&date_from)));
+            param_idx += 1;
+        }
+
+        if let Some(date_to) = filter.date_to {
+            sql.push_str(&format!(" AND date <= ?{param_idx}"));
+            params_vec.push(Box::new(format_dt(&date_to)));
+            param_idx += 1;
+        }
+
+        sql.push_str(" ORDER BY date DESC");
+
+        if let Some(limit) = filter.limit {
+            sql.push_str(&format!(" LIMIT ?{param_idx}"));
+            params_vec.push(Box::new(limit as i64));
+            param_idx += 1;
+        }
+
+        if let Some(offset) = filter.offset {
+            sql.push_str(&format!(" OFFSET ?{param_idx}"));
+            params_vec.push(Box::new(offset as i64));
+            #[allow(unused_assignments)]
+            { param_idx += 1; }
+        }
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql).map_err(StorageError::from)?;
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| row_to_transaction(row))
+            .map_err(StorageError::from)?;
+
+        let mut transactions = Vec::new();
+        for row in rows {
+            transactions.push(row.map_err(StorageError::from)?);
+        }
+        Ok(transactions)
     }
 }
 

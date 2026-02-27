@@ -3,17 +3,20 @@ use std::os::raw::c_char;
 use std::path::Path;
 
 use finance_core::entities::{TransactionType, User};
+use finance_core::entities::search::TransactionSearchFilter;
 use finance_core::repositories::{
-    AccountRepository, CategoryRepository, TransactionRepository, UserRepository,
+    AccountRepository, CategoryRepository, TransactionRepository,
+    UserRepository,
 };
 use finance_core::use_cases::{
-    AccountUseCases, BudgetUseCases, CategoryUseCases, RecurringTransactionUseCases,
-    StatisticsUseCases, TransactionUseCases,
+    AccountUseCases, BudgetUseCases, CategoryUseCases, CurrencyUseCases,
+    RecurringTransactionUseCases, SearchUseCases, StatisticsUseCases, TransactionUseCases,
 };
 use finance_storage::database::Database;
 use finance_storage::repositories::{
     SqliteAccountRepository, SqliteBudgetRepository, SqliteCategoryRepository,
-    SqliteRecurringTransactionRepository, SqliteTransactionRepository, SqliteUserRepository,
+    SqliteExchangeRateRepository, SqliteRecurringTransactionRepository,
+    SqliteTransactionRepository, SqliteUserRepository,
 };
 
 use serde::Serialize;
@@ -176,6 +179,37 @@ pub unsafe extern "C" fn create_category(
             .map_err(|e| FfiResult::error(21, format!("{e}")))?;
 
         let data = serde_json::to_value(&category)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Seed default categories for a user if none exist yet.
+/// Idempotent — returns existing categories if already seeded.
+///
+/// # Safety
+/// `user_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn seed_default_categories(user_id: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let user_id_str = cstr_to_str(user_id)?;
+        let user_uuid = Uuid::parse_str(user_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+
+        let repo = SqliteCategoryRepository::new(db);
+        let use_cases = CategoryUseCases::new(&repo);
+        let categories = use_cases
+            .seed_default_categories(user_uuid)
+            .map_err(|e| FfiResult::error(21, format!("{e}")))?;
+
+        let data = serde_json::to_value(&categories)
             .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
 
         Ok(FfiResult::ok(data))
@@ -717,6 +751,231 @@ pub unsafe extern "C" fn get_budget_progress(budget_id: *const c_char) -> *mut c
             .map_err(|e| FfiResult::error(53, format!("{e}")))?;
 
         let data = serde_json::to_value(&progress)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+// ─── Currency Conversion Functions ───────────────────────────────────────────
+
+/// Seed bundled default exchange rates into the database. Call once after init_database.
+///
+/// # Safety
+/// Database must be initialized.
+#[no_mangle]
+pub unsafe extern "C" fn seed_exchange_rates() -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let repo = SqliteExchangeRateRepository::new(db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        let count = use_cases
+            .seed_bundled_rates()
+            .map_err(|e| FfiResult::error(60, format!("{e}")))?;
+
+        Ok(FfiResult::ok(serde_json::json!({ "seeded": count })))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Update cached exchange rates from external API data.
+/// `rates_json` must be a JSON array: `[{"from":"USD","to":"EUR","rate":0.92}, ...]`
+///
+/// # Safety
+/// `rates_json` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn update_exchange_rates(rates_json: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let json_str = cstr_to_str(rates_json)?;
+
+        let repo = SqliteExchangeRateRepository::new(db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        let count = use_cases
+            .update_cached_rates(json_str)
+            .map_err(|e| FfiResult::error(61, format!("{e}")))?;
+
+        Ok(FfiResult::ok(serde_json::json!({ "updated": count })))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Set a manual exchange rate (user override — highest priority).
+///
+/// # Safety
+/// `from_currency` and `to_currency` must be valid C strings. `rate` is a float.
+#[no_mangle]
+pub unsafe extern "C" fn set_manual_exchange_rate(
+    from_currency: *const c_char,
+    to_currency: *const c_char,
+    rate: f64,
+) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let from_str = cstr_to_str(from_currency)?;
+        let to_str = cstr_to_str(to_currency)?;
+
+        let repo = SqliteExchangeRateRepository::new(db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        let exchange_rate = use_cases
+            .set_manual_rate(from_str, to_str, rate)
+            .map_err(|e| FfiResult::error(62, format!("{e}")))?;
+
+        let data = serde_json::to_value(&exchange_rate)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Convert an amount between currencies using the 3-tier rate resolution.
+///
+/// # Safety
+/// `from_currency` and `to_currency` must be valid C strings. `amount_cents` is in cents.
+#[no_mangle]
+pub unsafe extern "C" fn convert_currency(
+    amount_cents: i64,
+    from_currency: *const c_char,
+    to_currency: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let from_str = cstr_to_str(from_currency)?;
+        let to_str = cstr_to_str(to_currency)?;
+
+        let repo = SqliteExchangeRateRepository::new(db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        let conversion = use_cases
+            .convert(amount_cents, from_str, to_str)
+            .map_err(|e| FfiResult::error(63, format!("{e}")))?;
+
+        let data = serde_json::to_value(&conversion)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Get rate freshness info for a currency pair.
+///
+/// # Safety
+/// `from_currency` and `to_currency` must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn get_rate_freshness(
+    from_currency: *const c_char,
+    to_currency: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let from_str = cstr_to_str(from_currency)?;
+        let to_str = cstr_to_str(to_currency)?;
+
+        let repo = SqliteExchangeRateRepository::new(db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        let freshness = use_cases
+            .get_rate_freshness(from_str, to_str)
+            .map_err(|e| FfiResult::error(64, format!("{e}")))?;
+
+        let data = serde_json::to_value(&freshness)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// List all exchange rates from a base currency.
+///
+/// # Safety
+/// `from_currency` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn list_exchange_rates(from_currency: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let from_str = cstr_to_str(from_currency)?;
+
+        let repo = SqliteExchangeRateRepository::new(db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        let rates = use_cases
+            .list_rates(from_str)
+            .map_err(|e| FfiResult::error(65, format!("{e}")))?;
+
+        let data = serde_json::to_value(&rates)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+// ─── Search & Filtering ──────────────────────────────────────────────────────
+
+/// Search transactions with flexible filtering.
+/// `filter_json` is a JSON object with optional fields:
+/// - account_id (required, UUID string)
+/// - query (optional, text search on description)
+/// - category_id (optional, UUID string)
+/// - transaction_type (optional, "income"/"expense"/"transfer")
+/// - min_amount, max_amount (optional, cents)
+/// - date_from, date_to (optional, RFC3339)
+/// - limit, offset (optional, pagination)
+///
+/// # Safety
+/// `filter_json` must be a valid C string containing JSON.
+#[no_mangle]
+pub unsafe extern "C" fn search_transactions(filter_json: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let json_str = cstr_to_str(filter_json)?;
+
+        let filter: TransactionSearchFilter = serde_json::from_str(json_str)
+            .map_err(|e| FfiResult::error(3, format!("Invalid filter JSON: {e}")))?;
+
+        let repo = SqliteTransactionRepository::new(db);
+        let use_cases = SearchUseCases::new(&repo);
+
+        let transactions = use_cases
+            .search_transactions(&filter)
+            .map_err(|e| FfiResult::error(70, format!("{e}")))?;
+
+        let data = serde_json::to_value(&transactions)
             .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
 
         Ok(FfiResult::ok(data))

@@ -39,6 +39,15 @@ char *create_category(const char *user_id,
                       const char *icon);
 
 /**
+ * Seed default categories for a user if none exist yet.
+ * Idempotent — returns existing categories if already seeded.
+ *
+ * # Safety
+ * `user_id` must be a valid C string containing a UUID.
+ */
+char *seed_default_categories(const char *user_id);
+
+/**
  * Create a new transaction.
  *
  * # Safety
@@ -161,6 +170,76 @@ char *delete_budget(const char *id);
  * `budget_id` must be a valid C string.
  */
 char *get_budget_progress(const char *budget_id);
+
+/**
+ * Seed bundled default exchange rates into the database. Call once after init_database.
+ *
+ * # Safety
+ * Database must be initialized.
+ */
+char *seed_exchange_rates(void);
+
+/**
+ * Update cached exchange rates from external API data.
+ * `rates_json` must be a JSON array: `[{"from":"USD","to":"EUR","rate":0.92}, ...]`
+ *
+ * # Safety
+ * `rates_json` must be a valid C string.
+ */
+char *update_exchange_rates(const char *rates_json);
+
+/**
+ * Set a manual exchange rate (user override — highest priority).
+ *
+ * # Safety
+ * `from_currency` and `to_currency` must be valid C strings. `rate` is a float.
+ */
+char *set_manual_exchange_rate(const char *from_currency,
+                               const char *to_currency,
+                               double rate);
+
+/**
+ * Convert an amount between currencies using the 3-tier rate resolution.
+ *
+ * # Safety
+ * `from_currency` and `to_currency` must be valid C strings. `amount_cents` is in cents.
+ */
+char *convert_currency(int64_t amount_cents,
+                       const char *from_currency,
+                       const char *to_currency);
+
+/**
+ * Get rate freshness info for a currency pair.
+ *
+ * # Safety
+ * `from_currency` and `to_currency` must be valid C strings.
+ */
+char *get_rate_freshness(const char *from_currency,
+                         const char *to_currency);
+
+/**
+ * List all exchange rates from a base currency.
+ *
+ * # Safety
+ * `from_currency` must be a valid C string.
+ */
+char *list_exchange_rates(const char *from_currency);
+
+/**
+ * Search transactions with flexible filtering.
+ * `filter_json` is a JSON object with optional fields:
+ * - account_id (required, UUID string)
+ * - query (optional, text search on description)
+ * - category_id (optional, UUID string)
+ * - transaction_type (optional, "income"/"expense"/"transfer")
+ * - min_amount, max_amount (optional, cents)
+ * - date_from, date_to (optional, RFC3339)
+ * - limit, offset (optional, pagination)
+ *
+ * # Safety
+ * `filter_json` must be a valid C string containing JSON.
+ */
+char *search_transactions(const char *filter_json);
 
 /**
  * Free a string that was allocated by the FFI layer.

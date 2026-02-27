@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use finance_core::entities::common::{SyncStatus, TransactionType};
 use finance_core::entities::{Account, Category, Transaction};
+use finance_core::entities::search::TransactionSearchFilter;
 use finance_core::errors::DomainError;
 use finance_core::repositories::{AccountRepository, CategoryRepository, TransactionRepository};
 use finance_core::use_cases::CategorySpending;
@@ -297,6 +298,14 @@ impl TransactionRepository for InMemoryTransactionRepository {
         _from: DateTime<Utc>,
         _to: DateTime<Utc>,
     ) -> Result<Vec<CategorySpending>, DomainError> {
+        // Mock implementation - not needed for sync tests
+        Ok(Vec::new())
+    }
+
+    fn search(
+        &self,
+        _filter: &TransactionSearchFilter,
+    ) -> Result<Vec<Transaction>, DomainError> {
         // Mock implementation - not needed for sync tests
         Ok(Vec::new())
     }

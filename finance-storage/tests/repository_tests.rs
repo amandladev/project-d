@@ -4,14 +4,20 @@ mod tests {
     use uuid::Uuid;
 
     use finance_core::entities::{Account, Category, TransactionType, User};
+    use finance_core::entities::exchange_rate::RateSource;
+    use finance_core::entities::search::TransactionSearchFilter;
     use finance_core::repositories::{
-        AccountRepository, CategoryRepository, TransactionRepository, UserRepository,
+        AccountRepository, CategoryRepository, ExchangeRateRepository,
+        TransactionRepository, UserRepository,
     };
-    use finance_core::use_cases::{AccountUseCases, CategoryUseCases, StatisticsUseCases, TransactionUseCases};
+    use finance_core::use_cases::{
+        AccountUseCases, CategoryUseCases, CurrencyUseCases, SearchUseCases,
+        StatisticsUseCases, TransactionUseCases,
+    };
     use finance_storage::database::Database;
     use finance_storage::repositories::{
-        SqliteAccountRepository, SqliteCategoryRepository, SqliteTransactionRepository,
-        SqliteUserRepository,
+        SqliteAccountRepository, SqliteCategoryRepository, SqliteExchangeRateRepository,
+        SqliteTransactionRepository, SqliteUserRepository,
     };
 
     fn setup() -> Database {
@@ -164,6 +170,62 @@ mod tests {
         let found = repo.find_by_id(category.id()).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "Transport");
+    }
+
+    #[test]
+    fn test_seed_default_categories() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteCategoryRepository::new(&db);
+        let use_cases = CategoryUseCases::new(&repo);
+
+        // First call should create 18 default categories
+        let categories = use_cases.seed_default_categories(user.id()).unwrap();
+        assert_eq!(categories.len(), 18);
+        assert_eq!(categories[0].name, "Salary");
+        assert_eq!(categories[0].icon, Some("💼".to_string()));
+        assert_eq!(categories[17].name, "Other");
+        assert_eq!(categories[17].icon, Some("💰".to_string()));
+    }
+
+    #[test]
+    fn test_seed_default_categories_idempotent() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteCategoryRepository::new(&db);
+        let use_cases = CategoryUseCases::new(&repo);
+
+        // Seed once
+        let first = use_cases.seed_default_categories(user.id()).unwrap();
+        assert_eq!(first.len(), 18);
+
+        // Seed again — should return existing, not duplicate
+        let second = use_cases.seed_default_categories(user.id()).unwrap();
+        assert_eq!(second.len(), 18);
+
+        // Verify same IDs
+        assert_eq!(first[0].id(), second[0].id());
+    }
+
+    #[test]
+    fn test_seed_skipped_when_categories_exist() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteCategoryRepository::new(&db);
+        let use_cases = CategoryUseCases::new(&repo);
+
+        // Create one custom category first
+        use_cases
+            .create_category(user.id(), "My Custom".to_string(), Some("🔥".to_string()))
+            .unwrap();
+
+        // Seed should not add defaults since categories already exist
+        let categories = use_cases.seed_default_categories(user.id()).unwrap();
+        assert_eq!(categories.len(), 1);
+        assert_eq!(categories[0].name, "My Custom");
     }
 
     // ─── Transaction Repository Tests ────────────────────────────────────────
@@ -581,5 +643,301 @@ mod tests {
 
         assert_eq!(summary.income, 100_00);
         assert_eq!(summary.expenses, 0);
+    }
+
+    // ─── Currency Tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_seed_bundled_rates() {
+        let db = setup();
+        let repo = SqliteExchangeRateRepository::new(&db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        let count = use_cases.seed_bundled_rates().unwrap();
+        assert!(count > 0);
+
+        // Should find USD→EUR
+        let rate = repo.find_best_rate("USD", "EUR").unwrap();
+        assert!(rate.is_some());
+        let rate = rate.unwrap();
+        assert_eq!(rate.source, RateSource::Bundled);
+    }
+
+    #[test]
+    fn test_convert_currency() {
+        let db = setup();
+        let repo = SqliteExchangeRateRepository::new(&db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        use_cases.seed_bundled_rates().unwrap();
+
+        // Convert $100.00 to EUR
+        let result = use_cases.convert(10_000, "USD", "EUR").unwrap();
+        assert_eq!(result.from_currency, "USD");
+        assert_eq!(result.to_currency, "EUR");
+        assert!(result.converted_amount > 0);
+        assert!(result.converted_amount < 10_000); // EUR is worth more
+    }
+
+    #[test]
+    fn test_same_currency_conversion() {
+        let db = setup();
+        let repo = SqliteExchangeRateRepository::new(&db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        // No need to seed — same currency always works
+        let result = use_cases.convert(5_000, "USD", "USD").unwrap();
+        assert_eq!(result.converted_amount, 5_000);
+    }
+
+    #[test]
+    fn test_user_override_takes_priority() {
+        let db = setup();
+        let repo = SqliteExchangeRateRepository::new(&db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        use_cases.seed_bundled_rates().unwrap();
+
+        // Set a manual rate (user override)
+        use_cases.set_manual_rate("USD", "EUR", 0.95).unwrap();
+
+        // Should use the override rate, not the bundled one
+        let rate = repo.find_best_rate("USD", "EUR").unwrap().unwrap();
+        assert_eq!(rate.source, RateSource::UserOverride);
+
+        let result = use_cases.convert(10_000, "USD", "EUR").unwrap();
+        assert_eq!(result.converted_amount, 9_500); // 0.95 * 10000
+    }
+
+    #[test]
+    fn test_update_cached_rates() {
+        let db = setup();
+        let repo = SqliteExchangeRateRepository::new(&db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        use_cases.seed_bundled_rates().unwrap();
+
+        // Simulate API response
+        let json = r#"[{"from":"USD","to":"EUR","rate":0.91},{"from":"USD","to":"GBP","rate":0.78}]"#;
+        let count = use_cases.update_cached_rates(json).unwrap();
+        assert_eq!(count, 2);
+
+        // Cached rate should now have priority over bundled
+        let rate = repo.find_best_rate("USD", "EUR").unwrap().unwrap();
+        assert_eq!(rate.source, RateSource::Cached);
+    }
+
+    #[test]
+    fn test_rate_freshness() {
+        let db = setup();
+        let repo = SqliteExchangeRateRepository::new(&db);
+        let use_cases = CurrencyUseCases::new(&repo);
+
+        use_cases.seed_bundled_rates().unwrap();
+
+        let freshness = use_cases.get_rate_freshness("USD", "EUR").unwrap();
+        assert!(freshness.is_some());
+        let freshness = freshness.unwrap();
+        assert!(freshness.age_seconds >= 0);
+    }
+
+    // ─── Search & Filtering Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_search_by_description() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 100_00,
+            TransactionType::Expense, "Coffee at Starbucks".to_string(), now,
+        ).unwrap();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 50_00,
+            TransactionType::Expense, "Netflix subscription".to_string(), now,
+        ).unwrap();
+
+        let search = SearchUseCases::new(&repo);
+        let filter = TransactionSearchFilter {
+            account_id: account.id(),
+            query: Some("coffee".to_string()),
+            ..Default::default()
+        };
+
+        let results = search.search_transactions(&filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].description.contains("Coffee"));
+    }
+
+    #[test]
+    fn test_search_by_amount_range() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 10_00,
+            TransactionType::Expense, "Small".to_string(), now,
+        ).unwrap();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 500_00,
+            TransactionType::Expense, "Medium".to_string(), now,
+        ).unwrap();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 5000_00,
+            TransactionType::Expense, "Large".to_string(), now,
+        ).unwrap();
+
+        let search = SearchUseCases::new(&repo);
+        let filter = TransactionSearchFilter {
+            account_id: account.id(),
+            min_amount: Some(100_00),
+            max_amount: Some(1000_00),
+            ..Default::default()
+        };
+
+        let results = search.search_transactions(&filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].description, "Medium");
+    }
+
+    #[test]
+    fn test_search_by_transaction_type() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 100_00,
+            TransactionType::Income, "Salary".to_string(), now,
+        ).unwrap();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 50_00,
+            TransactionType::Expense, "Lunch".to_string(), now,
+        ).unwrap();
+
+        let search = SearchUseCases::new(&repo);
+        let filter = TransactionSearchFilter {
+            account_id: account.id(),
+            transaction_type: Some(TransactionType::Income),
+            ..Default::default()
+        };
+
+        let results = search.search_transactions(&filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].description, "Salary");
+    }
+
+    #[test]
+    fn test_search_with_pagination() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+        for i in 0..5 {
+            tx_use_cases.create_transaction(
+                account.id(), category.id(), (i + 1) * 100,
+                TransactionType::Expense, format!("Item {i}"), now,
+            ).unwrap();
+        }
+
+        let search = SearchUseCases::new(&repo);
+
+        // First page
+        let filter = TransactionSearchFilter {
+            account_id: account.id(),
+            limit: Some(2),
+            offset: Some(0),
+            ..Default::default()
+        };
+        let page1 = search.search_transactions(&filter).unwrap();
+        assert_eq!(page1.len(), 2);
+
+        // Second page
+        let filter = TransactionSearchFilter {
+            account_id: account.id(),
+            limit: Some(2),
+            offset: Some(2),
+            ..Default::default()
+        };
+        let page2 = search.search_transactions(&filter).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        // Third page (partial)
+        let filter = TransactionSearchFilter {
+            account_id: account.id(),
+            limit: Some(2),
+            offset: Some(4),
+            ..Default::default()
+        };
+        let page3 = search.search_transactions(&filter).unwrap();
+        assert_eq!(page3.len(), 1);
+    }
+
+    #[test]
+    fn test_search_combined_filters() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let cat_repo = SqliteCategoryRepository::new(&db);
+        let cat_uc = CategoryUseCases::new(&cat_repo);
+        let transport = cat_uc.create_category(
+            user.id(), "Transport".to_string(), Some("🚗".to_string()),
+        ).unwrap();
+
+        let repo = SqliteTransactionRepository::new(&db);
+        let tx_use_cases = TransactionUseCases::new(&repo);
+
+        let now = Utc::now();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 200_00,
+            TransactionType::Expense, "Pizza delivery".to_string(), now,
+        ).unwrap();
+        tx_use_cases.create_transaction(
+            account.id(), transport.id(), 300_00,
+            TransactionType::Expense, "Uber ride".to_string(), now,
+        ).unwrap();
+        tx_use_cases.create_transaction(
+            account.id(), category.id(), 50_00,
+            TransactionType::Income, "Refund pizza".to_string(), now,
+        ).unwrap();
+
+        let search = SearchUseCases::new(&repo);
+
+        // Search for expenses in Food category containing "pizza"
+        let filter = TransactionSearchFilter {
+            account_id: account.id(),
+            query: Some("pizza".to_string()),
+            category_id: Some(category.id()),
+            transaction_type: Some(TransactionType::Expense),
+            ..Default::default()
+        };
+
+        let results = search.search_transactions(&filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].description, "Pizza delivery");
     }
 }

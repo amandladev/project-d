@@ -106,6 +106,20 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_recurring_transactions_is_active ON recurring_transactions(is_active);
         CREATE INDEX IF NOT EXISTS idx_budgets_account_id ON budgets(account_id);
         CREATE INDEX IF NOT EXISTS idx_budgets_category_id ON budgets(category_id);
+
+        -- Exchange rates table
+        CREATE TABLE IF NOT EXISTS exchange_rates (
+            from_currency TEXT NOT NULL,
+            to_currency TEXT NOT NULL,
+            rate INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'bundled',
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY (from_currency, to_currency, source)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_exchange_rates_pair ON exchange_rates(from_currency, to_currency);
+        CREATE INDEX IF NOT EXISTS idx_transactions_description ON transactions(description);
+        CREATE INDEX IF NOT EXISTS idx_transactions_amount ON transactions(amount);
         ",
     )
     .map_err(|e| StorageError::Migration(e.to_string()))?;

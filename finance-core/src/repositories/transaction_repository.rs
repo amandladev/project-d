@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::entities::Transaction;
+use crate::entities::search::TransactionSearchFilter;
 use crate::errors::DomainError;
 use crate::use_cases::statistics_use_cases::CategorySpending;
 
@@ -26,4 +27,9 @@ pub trait TransactionRepository: Send + Sync {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<CategorySpending>, DomainError>;
+    /// Search transactions with flexible filtering.
+    fn search(
+        &self,
+        filter: &TransactionSearchFilter,
+    ) -> Result<Vec<Transaction>, DomainError>;
 }
