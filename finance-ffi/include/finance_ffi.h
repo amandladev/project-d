@@ -242,6 +242,84 @@ char *list_exchange_rates(const char *from_currency);
 char *search_transactions(const char *filter_json);
 
 /**
+ * Create a new tag for a user.
+ *
+ * # Safety
+ * All pointer parameters must be valid C strings. `color` can be null.
+ */
+char *create_tag(const char *user_id,
+                 const char *name,
+                 const char *color);
+
+/**
+ * List all tags for a user.
+ *
+ * # Safety
+ * `user_id` must be a valid C string containing a UUID.
+ */
+char *list_tags(const char *user_id);
+
+/**
+ * Update a tag's name and/or color.
+ * Pass JSON: {"name": "New Name", "color": "#FF5733"} — both fields are optional.
+ *
+ * # Safety
+ * All pointer parameters must be valid C strings.
+ */
+char *update_tag(const char *tag_id,
+                 const char *update_json);
+
+/**
+ * Delete a tag and all its transaction associations.
+ *
+ * # Safety
+ * `tag_id` must be a valid C string containing a UUID.
+ */
+char *delete_tag(const char *tag_id);
+
+/**
+ * Add a tag to a transaction.
+ *
+ * # Safety
+ * Both parameters must be valid C strings containing UUIDs.
+ */
+char *add_tag_to_transaction(const char *transaction_id,
+                             const char *tag_id);
+
+/**
+ * Remove a tag from a transaction.
+ *
+ * # Safety
+ * Both parameters must be valid C strings containing UUIDs.
+ */
+char *remove_tag_from_transaction(const char *transaction_id,
+                                  const char *tag_id);
+
+/**
+ * Get all tags attached to a transaction.
+ *
+ * # Safety
+ * `transaction_id` must be a valid C string containing a UUID.
+ */
+char *get_transaction_tags(const char *transaction_id);
+
+/**
+ * Get all transaction IDs that have a given tag.
+ *
+ * # Safety
+ * `tag_id` must be a valid C string containing a UUID.
+ */
+char *get_transactions_by_tag(const char *tag_id);
+
+/**
+ * Get progress for all budgets in an account.
+ *
+ * # Safety
+ * `account_id` must be a valid C string containing a UUID.
+ */
+char *get_all_budgets_progress(const char *account_id);
+
+/**
  * Free a string that was allocated by the FFI layer.
  *
  * # Safety

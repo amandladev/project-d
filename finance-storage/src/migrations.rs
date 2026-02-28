@@ -120,6 +120,31 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_exchange_rates_pair ON exchange_rates(from_currency, to_currency);
         CREATE INDEX IF NOT EXISTS idx_transactions_description ON transactions(description);
         CREATE INDEX IF NOT EXISTS idx_transactions_amount ON transactions(amount);
+
+        -- Tags table
+        CREATE TABLE IF NOT EXISTS tags (
+            id TEXT PRIMARY KEY NOT NULL,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            color TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            deleted_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        -- Junction table for many-to-many transaction <-> tag
+        CREATE TABLE IF NOT EXISTS transaction_tags (
+            transaction_id TEXT NOT NULL,
+            tag_id TEXT NOT NULL,
+            PRIMARY KEY (transaction_id, tag_id),
+            FOREIGN KEY (transaction_id) REFERENCES transactions(id),
+            FOREIGN KEY (tag_id) REFERENCES tags(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tags_user_id ON tags(user_id);
+        CREATE INDEX IF NOT EXISTS idx_transaction_tags_tag_id ON transaction_tags(tag_id);
+        CREATE INDEX IF NOT EXISTS idx_transaction_tags_transaction_id ON transaction_tags(transaction_id);
         ",
     )
     .map_err(|e| StorageError::Migration(e.to_string()))?;

@@ -8,16 +8,16 @@ mod tests {
     use finance_core::entities::search::TransactionSearchFilter;
     use finance_core::repositories::{
         AccountRepository, CategoryRepository, ExchangeRateRepository,
-        TransactionRepository, UserRepository,
+        TagRepository, TransactionRepository, UserRepository,
     };
     use finance_core::use_cases::{
         AccountUseCases, CategoryUseCases, CurrencyUseCases, SearchUseCases,
-        StatisticsUseCases, TransactionUseCases,
+        StatisticsUseCases, TagUseCases, TransactionUseCases,
     };
     use finance_storage::database::Database;
     use finance_storage::repositories::{
         SqliteAccountRepository, SqliteCategoryRepository, SqliteExchangeRateRepository,
-        SqliteTransactionRepository, SqliteUserRepository,
+        SqliteTagRepository, SqliteTransactionRepository, SqliteUserRepository,
     };
 
     fn setup() -> Database {
@@ -939,5 +939,241 @@ mod tests {
         let results = search.search_transactions(&filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].description, "Pizza delivery");
+    }
+
+    // ─── Tag Repository Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_tag_create_and_find() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteTagRepository::new(&db);
+        let use_cases = TagUseCases::new(&repo);
+
+        let tag = use_cases
+            .create_tag(user.id(), "Vacation".to_string(), Some("#FF5733".to_string()))
+            .unwrap();
+
+        let found = repo.find_by_id(tag.id()).unwrap();
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.name, "Vacation");
+        assert_eq!(found.color, Some("#FF5733".to_string()));
+    }
+
+    #[test]
+    fn test_tag_list_by_user() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteTagRepository::new(&db);
+        let use_cases = TagUseCases::new(&repo);
+
+        use_cases.create_tag(user.id(), "Work".to_string(), None).unwrap();
+        use_cases.create_tag(user.id(), "Personal".to_string(), Some("#00FF00".to_string())).unwrap();
+
+        let tags = use_cases.list_tags(user.id()).unwrap();
+        assert_eq!(tags.len(), 2);
+        // Sorted alphabetically
+        assert_eq!(tags[0].name, "Personal");
+        assert_eq!(tags[1].name, "Work");
+    }
+
+    #[test]
+    fn test_tag_update() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteTagRepository::new(&db);
+        let use_cases = TagUseCases::new(&repo);
+
+        let tag = use_cases
+            .create_tag(user.id(), "Old Name".to_string(), Some("#000000".to_string()))
+            .unwrap();
+
+        let updated = use_cases
+            .update_tag(tag.id(), Some("New Name".to_string()), Some(Some("#FFFFFF".to_string())))
+            .unwrap();
+
+        assert_eq!(updated.name, "New Name");
+        assert_eq!(updated.color, Some("#FFFFFF".to_string()));
+    }
+
+    #[test]
+    fn test_tag_delete_removes_associations() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let tag_repo = SqliteTagRepository::new(&db);
+        let tag_uc = TagUseCases::new(&tag_repo);
+
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        let tag = tag_uc.create_tag(user.id(), "ToDelete".to_string(), None).unwrap();
+        let tx = tx_uc.create_transaction(
+            account.id(), category.id(), 1000,
+            TransactionType::Expense, "Test".to_string(), Utc::now(),
+        ).unwrap();
+
+        tag_uc.add_tag_to_transaction(tx.id(), tag.id()).unwrap();
+
+        // Verify tag is there
+        let tags = tag_uc.get_transaction_tags(tx.id()).unwrap();
+        assert_eq!(tags.len(), 1);
+
+        // Delete tag — should also remove association
+        tag_uc.delete_tag(tag.id()).unwrap();
+
+        let tags_after = tag_uc.get_transaction_tags(tx.id()).unwrap();
+        assert_eq!(tags_after.len(), 0);
+    }
+
+    #[test]
+    fn test_tag_transaction_association() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let tag_repo = SqliteTagRepository::new(&db);
+        let tag_uc = TagUseCases::new(&tag_repo);
+
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        let tag1 = tag_uc.create_tag(user.id(), "Food".to_string(), None).unwrap();
+        let tag2 = tag_uc.create_tag(user.id(), "Restaurant".to_string(), None).unwrap();
+
+        let tx1 = tx_uc.create_transaction(
+            account.id(), category.id(), 2000,
+            TransactionType::Expense, "Lunch".to_string(), Utc::now(),
+        ).unwrap();
+        let tx2 = tx_uc.create_transaction(
+            account.id(), category.id(), 3000,
+            TransactionType::Expense, "Dinner".to_string(), Utc::now(),
+        ).unwrap();
+
+        // Tag both transactions with "Food"
+        tag_uc.add_tag_to_transaction(tx1.id(), tag1.id()).unwrap();
+        tag_uc.add_tag_to_transaction(tx2.id(), tag1.id()).unwrap();
+        // Tag tx1 with "Restaurant" too
+        tag_uc.add_tag_to_transaction(tx1.id(), tag2.id()).unwrap();
+
+        // tx1 should have 2 tags
+        let tags_tx1 = tag_uc.get_transaction_tags(tx1.id()).unwrap();
+        assert_eq!(tags_tx1.len(), 2);
+
+        // tx2 should have 1 tag
+        let tags_tx2 = tag_uc.get_transaction_tags(tx2.id()).unwrap();
+        assert_eq!(tags_tx2.len(), 1);
+
+        // "Food" tag should be on 2 transactions
+        let tx_ids = tag_uc.get_transactions_by_tag(tag1.id()).unwrap();
+        assert_eq!(tx_ids.len(), 2);
+
+        // Remove "Food" from tx2
+        tag_uc.remove_tag_from_transaction(tx2.id(), tag1.id()).unwrap();
+        let tx_ids_after = tag_uc.get_transactions_by_tag(tag1.id()).unwrap();
+        assert_eq!(tx_ids_after.len(), 1);
+    }
+
+    #[test]
+    fn test_tag_add_duplicate_ignored() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let tag_repo = SqliteTagRepository::new(&db);
+        let tag_uc = TagUseCases::new(&tag_repo);
+
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        let tag = tag_uc.create_tag(user.id(), "Dup".to_string(), None).unwrap();
+        let tx = tx_uc.create_transaction(
+            account.id(), category.id(), 500,
+            TransactionType::Expense, "Test".to_string(), Utc::now(),
+        ).unwrap();
+
+        // Add same tag twice — should not error (INSERT OR IGNORE)
+        tag_uc.add_tag_to_transaction(tx.id(), tag.id()).unwrap();
+        tag_uc.add_tag_to_transaction(tx.id(), tag.id()).unwrap();
+
+        let tags = tag_uc.get_transaction_tags(tx.id()).unwrap();
+        assert_eq!(tags.len(), 1);
+    }
+
+    #[test]
+    fn test_tag_empty_name_rejected() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteTagRepository::new(&db);
+        let use_cases = TagUseCases::new(&repo);
+
+        let result = use_cases.create_tag(user.id(), "".to_string(), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tag_invalid_color_rejected() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let repo = SqliteTagRepository::new(&db);
+        let use_cases = TagUseCases::new(&repo);
+
+        let result = use_cases.create_tag(user.id(), "Bad".to_string(), Some("red".to_string()));
+        assert!(result.is_err());
+    }
+
+    // ─── Budget Progress Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_budget_progress_calculation() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let budget_repo = SqliteBudgetRepository::new(&db);
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let budget_uc = BudgetUseCases::new(&budget_repo, &tx_repo);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        use finance_core::use_cases::BudgetUseCases;
+        use finance_storage::repositories::SqliteBudgetRepository;
+
+        let now = Utc::now();
+        let budget = budget_uc
+            .create_budget(
+                account.id(),
+                Some(category.id()),
+                "Food Budget".to_string(),
+                100_00, // $100
+                "monthly",
+                now - Duration::days(1),
+            )
+            .unwrap();
+
+        // Create some expenses
+        tx_uc.create_transaction(
+            account.id(), category.id(), 30_00,
+            TransactionType::Expense, "Groceries".to_string(), now,
+        ).unwrap();
+        tx_uc.create_transaction(
+            account.id(), category.id(), 20_00,
+            TransactionType::Expense, "Restaurant".to_string(), now,
+        ).unwrap();
+
+        let progress = budget_uc.get_budget_progress(budget.base.id).unwrap();
+        assert_eq!(progress.spent, 50_00);
+        assert_eq!(progress.remaining, 50_00);
+        assert!((progress.percentage - 50.0).abs() < 0.01);
     }
 }

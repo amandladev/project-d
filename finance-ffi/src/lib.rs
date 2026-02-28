@@ -10,13 +10,14 @@ use finance_core::repositories::{
 };
 use finance_core::use_cases::{
     AccountUseCases, BudgetUseCases, CategoryUseCases, CurrencyUseCases,
-    RecurringTransactionUseCases, SearchUseCases, StatisticsUseCases, TransactionUseCases,
+    RecurringTransactionUseCases, SearchUseCases, StatisticsUseCases, TagUseCases,
+    TransactionUseCases,
 };
 use finance_storage::database::Database;
 use finance_storage::repositories::{
     SqliteAccountRepository, SqliteBudgetRepository, SqliteCategoryRepository,
     SqliteExchangeRateRepository, SqliteRecurringTransactionRepository,
-    SqliteTransactionRepository, SqliteUserRepository,
+    SqliteTagRepository, SqliteTransactionRepository, SqliteUserRepository,
 };
 
 use serde::Serialize;
@@ -976,6 +977,323 @@ pub unsafe extern "C" fn search_transactions(filter_json: *const c_char) -> *mut
             .map_err(|e| FfiResult::error(70, format!("{e}")))?;
 
         let data = serde_json::to_value(&transactions)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+// ─── Tag Functions ───────────────────────────────────────────────────────────
+
+/// Create a new tag for a user.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings. `color` can be null.
+#[no_mangle]
+pub unsafe extern "C" fn create_tag(
+    user_id: *const c_char,
+    name: *const c_char,
+    color: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let user_id_str = cstr_to_str(user_id)?;
+        let name_str = cstr_to_str(name)?;
+        let color_str = if color.is_null() {
+            None
+        } else {
+            Some(cstr_to_str(color)?.to_string())
+        };
+
+        let user_uuid = Uuid::parse_str(user_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+
+        let tag = use_cases
+            .create_tag(user_uuid, name_str.to_string(), color_str)
+            .map_err(|e| FfiResult::error(80, format!("{e}")))?;
+
+        let data = serde_json::to_value(&tag)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// List all tags for a user.
+///
+/// # Safety
+/// `user_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn list_tags(user_id: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let user_id_str = cstr_to_str(user_id)?;
+        let user_uuid = Uuid::parse_str(user_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+        let tags = use_cases
+            .list_tags(user_uuid)
+            .map_err(|e| FfiResult::error(81, format!("{e}")))?;
+
+        let data = serde_json::to_value(&tags)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Update a tag's name and/or color.
+/// Pass JSON: {"name": "New Name", "color": "#FF5733"} — both fields are optional.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn update_tag(
+    tag_id: *const c_char,
+    update_json: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let tag_id_str = cstr_to_str(tag_id)?;
+        let json_str = cstr_to_str(update_json)?;
+
+        let tag_uuid = Uuid::parse_str(tag_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+
+        let update: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| FfiResult::error(4, format!("Invalid JSON: {e}")))?;
+
+        let name = update.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let color = if update.get("color").is_some() {
+            Some(update.get("color").unwrap().as_str().map(|s| s.to_string()))
+        } else {
+            None
+        };
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+        let tag = use_cases
+            .update_tag(tag_uuid, name, color)
+            .map_err(|e| FfiResult::error(82, format!("{e}")))?;
+
+        let data = serde_json::to_value(&tag)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Delete a tag and all its transaction associations.
+///
+/// # Safety
+/// `tag_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn delete_tag(tag_id: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let tag_id_str = cstr_to_str(tag_id)?;
+        let tag_uuid = Uuid::parse_str(tag_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+        use_cases
+            .delete_tag(tag_uuid)
+            .map_err(|e| FfiResult::error(83, format!("{e}")))?;
+
+        Ok(FfiResult::ok_empty())
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Add a tag to a transaction.
+///
+/// # Safety
+/// Both parameters must be valid C strings containing UUIDs.
+#[no_mangle]
+pub unsafe extern "C" fn add_tag_to_transaction(
+    transaction_id: *const c_char,
+    tag_id: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let tx_id_str = cstr_to_str(transaction_id)?;
+        let tag_id_str = cstr_to_str(tag_id)?;
+
+        let tx_uuid = Uuid::parse_str(tx_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
+        let tag_uuid = Uuid::parse_str(tag_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+        use_cases
+            .add_tag_to_transaction(tx_uuid, tag_uuid)
+            .map_err(|e| FfiResult::error(84, format!("{e}")))?;
+
+        Ok(FfiResult::ok_empty())
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Remove a tag from a transaction.
+///
+/// # Safety
+/// Both parameters must be valid C strings containing UUIDs.
+#[no_mangle]
+pub unsafe extern "C" fn remove_tag_from_transaction(
+    transaction_id: *const c_char,
+    tag_id: *const c_char,
+) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let tx_id_str = cstr_to_str(transaction_id)?;
+        let tag_id_str = cstr_to_str(tag_id)?;
+
+        let tx_uuid = Uuid::parse_str(tx_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
+        let tag_uuid = Uuid::parse_str(tag_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+        use_cases
+            .remove_tag_from_transaction(tx_uuid, tag_uuid)
+            .map_err(|e| FfiResult::error(85, format!("{e}")))?;
+
+        Ok(FfiResult::ok_empty())
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Get all tags attached to a transaction.
+///
+/// # Safety
+/// `transaction_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn get_transaction_tags(transaction_id: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let tx_id_str = cstr_to_str(transaction_id)?;
+        let tx_uuid = Uuid::parse_str(tx_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+        let tags = use_cases
+            .get_transaction_tags(tx_uuid)
+            .map_err(|e| FfiResult::error(86, format!("{e}")))?;
+
+        let data = serde_json::to_value(&tags)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+/// Get all transaction IDs that have a given tag.
+///
+/// # Safety
+/// `tag_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn get_transactions_by_tag(tag_id: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let tag_id_str = cstr_to_str(tag_id)?;
+        let tag_uuid = Uuid::parse_str(tag_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+
+        let repo = SqliteTagRepository::new(db);
+        let use_cases = TagUseCases::new(&repo);
+        let tx_ids = use_cases
+            .get_transactions_by_tag(tag_uuid)
+            .map_err(|e| FfiResult::error(87, format!("{e}")))?;
+
+        let data = serde_json::to_value(&tx_ids)
+            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+
+        Ok(FfiResult::ok(data))
+    })();
+
+    match result {
+        Ok(r) => r.to_json_cstring(),
+        Err(r) => r.to_json_cstring(),
+    }
+}
+
+// ─── Budget Progress (All) ──────────────────────────────────────────────────
+
+/// Get progress for all budgets in an account.
+///
+/// # Safety
+/// `account_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn get_all_budgets_progress(account_id: *const c_char) -> *mut c_char {
+    let result = (|| -> Result<FfiResult, FfiResult> {
+        let db = get_db()?;
+        let account_id_str = cstr_to_str(account_id)?;
+        let account_uuid = Uuid::parse_str(account_id_str)
+            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+
+        let budget_repo = SqliteBudgetRepository::new(db);
+        let transaction_repo = SqliteTransactionRepository::new(db);
+        let use_cases = BudgetUseCases::new(&budget_repo, &transaction_repo);
+
+        let budgets = use_cases
+            .list_budgets(account_uuid)
+            .map_err(|e| FfiResult::error(51, format!("{e}")))?;
+
+        let mut progress_list = Vec::new();
+        for budget in &budgets {
+            let progress = use_cases
+                .get_budget_progress(budget.base.id)
+                .map_err(|e| FfiResult::error(53, format!("{e}")))?;
+            progress_list.push(progress);
+        }
+
+        let data = serde_json::to_value(&progress_list)
             .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
 
         Ok(FfiResult::ok(data))

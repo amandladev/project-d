@@ -5,6 +5,7 @@ pub mod common;
 pub mod exchange_rate;
 pub mod recurring_transaction;
 pub mod search;
+pub mod tag;
 pub mod transaction;
 pub mod user;
 
@@ -15,5 +16,6 @@ pub use common::{BaseEntity, SyncStatus, TransactionType};
 pub use exchange_rate::{ConversionResult, ExchangeRate, RateSource, RATE_PRECISION};
 pub use recurring_transaction::{RecurrenceFrequency, RecurringTransaction};
 pub use search::TransactionSearchFilter;
+pub use tag::{Tag, TransactionTag};
 pub use transaction::Transaction;
 pub use user::User;
