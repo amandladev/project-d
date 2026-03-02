@@ -3,12 +3,13 @@ use rusqlite::params;
 use uuid::Uuid;
 
 use finance_core::entities::common::{BaseEntity, TransactionType};
+use finance_core::entities::pagination::{PageRequest, PaginatedResult};
 use finance_core::entities::{RecurrenceFrequency, RecurringTransaction};
 use finance_core::errors::DomainError;
 use finance_core::repositories::RecurringTransactionRepository;
 
 use crate::database::Database;
-use crate::date_utils::{format_dt, format_dt_opt};
+use crate::date_utils::{format_dt, format_dt_opt, parse_dt, parse_dt_opt, parse_uuid};
 use crate::error::StorageError;
 
 /// SQLite implementation of RecurringTransactionRepository.
@@ -84,6 +85,43 @@ impl<'a> RecurringTransactionRepository for SqliteRecurringTransactionRepository
             result.push(row.map_err(StorageError::from)?);
         }
         Ok(result)
+    }
+
+    fn find_by_account_id_paginated(
+        &self,
+        account_id: Uuid,
+        page: &PageRequest,
+    ) -> Result<PaginatedResult<RecurringTransaction>, DomainError> {
+        let conn = self.db.conn.lock().unwrap();
+
+        let total_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recurring_transactions WHERE account_id = ?1 AND deleted_at IS NULL",
+                params![account_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account_id, category_id, amount, transaction_type, description, frequency, start_date, end_date, next_occurrence, is_active, created_at, updated_at, deleted_at
+                 FROM recurring_transactions WHERE account_id = ?1 AND deleted_at IS NULL ORDER BY created_at DESC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(StorageError::from)?;
+
+        let rows = stmt
+            .query_map(
+                params![account_id.to_string(), page.limit as i64, page.offset as i64],
+                |row| row_to_recurring(row),
+            )
+            .map_err(StorageError::from)?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row.map_err(StorageError::from)?);
+        }
+        Ok(PaginatedResult::from_vec(items, total_count, page))
     }
 
     fn find_active(&self) -> Result<Vec<RecurringTransaction>, DomainError> {
@@ -177,37 +215,21 @@ fn row_to_recurring(row: &rusqlite::Row) -> rusqlite::Result<RecurringTransactio
 
     Ok(RecurringTransaction {
         base: BaseEntity {
-            id: Uuid::parse_str(&id_str).unwrap(),
-            created_at: DateTime::parse_from_rfc3339(&created_str)
-                .unwrap()
-                .with_timezone(&Utc),
-            updated_at: DateTime::parse_from_rfc3339(&updated_str)
-                .unwrap()
-                .with_timezone(&Utc),
-            deleted_at: deleted_str.map(|s| {
-                DateTime::parse_from_rfc3339(&s)
-                    .unwrap()
-                    .with_timezone(&Utc)
-            }),
+            id: parse_uuid(&id_str)?,
+            created_at: parse_dt(&created_str)?,
+            updated_at: parse_dt(&updated_str)?,
+            deleted_at: parse_dt_opt(deleted_str)?,
         },
-        account_id: Uuid::parse_str(&account_id_str).unwrap(),
-        category_id: Uuid::parse_str(&category_id_str).unwrap(),
+        account_id: parse_uuid(&account_id_str)?,
+        category_id: parse_uuid(&category_id_str)?,
         amount: row.get(3)?,
         transaction_type: TransactionType::from_str(&tx_type_str)
             .unwrap_or(TransactionType::Expense),
         description: row.get(5)?,
         frequency: RecurrenceFrequency::from_str(&freq_str).unwrap_or(RecurrenceFrequency::Monthly),
-        start_date: DateTime::parse_from_rfc3339(&start_str)
-            .unwrap()
-            .with_timezone(&Utc),
-        end_date: end_str.map(|s| {
-            DateTime::parse_from_rfc3339(&s)
-                .unwrap()
-                .with_timezone(&Utc)
-        }),
-        next_occurrence: DateTime::parse_from_rfc3339(&next_str)
-            .unwrap()
-            .with_timezone(&Utc),
+        start_date: parse_dt(&start_str)?,
+        end_date: parse_dt_opt(end_str)?,
+        next_occurrence: parse_dt(&next_str)?,
         is_active: row.get(10)?,
     })
 }

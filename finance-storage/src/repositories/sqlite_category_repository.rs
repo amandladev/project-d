@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::params;
 use uuid::Uuid;
 
@@ -8,7 +8,7 @@ use finance_core::errors::DomainError;
 use finance_core::repositories::CategoryRepository;
 
 use crate::database::Database;
-use crate::date_utils::{format_dt, format_dt_opt};
+use crate::date_utils::{format_dt, format_dt_opt, parse_dt, parse_dt_opt, parse_uuid};
 use crate::error::StorageError;
 
 /// SQLite implementation of CategoryRepository.
@@ -140,20 +140,12 @@ fn row_to_category(row: &rusqlite::Row) -> rusqlite::Result<Category> {
 
     Ok(Category {
         base: BaseEntity {
-            id: Uuid::parse_str(&id_str).unwrap(),
-            created_at: DateTime::parse_from_rfc3339(&created_str)
-                .unwrap()
-                .with_timezone(&Utc),
-            updated_at: DateTime::parse_from_rfc3339(&updated_str)
-                .unwrap()
-                .with_timezone(&Utc),
-            deleted_at: deleted_str.map(|s| {
-                DateTime::parse_from_rfc3339(&s)
-                    .unwrap()
-                    .with_timezone(&Utc)
-            }),
+            id: parse_uuid(&id_str)?,
+            created_at: parse_dt(&created_str)?,
+            updated_at: parse_dt(&updated_str)?,
+            deleted_at: parse_dt_opt(deleted_str)?,
         },
-        user_id: Uuid::parse_str(&user_id_str).unwrap(),
+        user_id: parse_uuid(&user_id_str)?,
         name: row.get(2)?,
         icon: row.get(3)?,
         sync_status: SyncStatus::from_str(&sync_str).unwrap_or(SyncStatus::Pending),

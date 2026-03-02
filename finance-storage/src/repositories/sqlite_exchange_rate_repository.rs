@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::params;
 
 use finance_core::entities::exchange_rate::{ExchangeRate, RateSource};
@@ -6,7 +6,7 @@ use finance_core::errors::DomainError;
 use finance_core::repositories::ExchangeRateRepository;
 
 use crate::database::Database;
-use crate::date_utils::format_dt;
+use crate::date_utils::{format_dt, parse_dt};
 use crate::error::StorageError;
 
 /// SQLite implementation of ExchangeRateRepository.
@@ -164,8 +164,6 @@ fn row_to_rate(row: &rusqlite::Row) -> rusqlite::Result<ExchangeRate> {
         to_currency: row.get(1)?,
         rate: row.get(2)?,
         source: RateSource::from_str(&source_str).unwrap_or(RateSource::Bundled),
-        fetched_at: DateTime::parse_from_rfc3339(&fetched_str)
-            .unwrap()
-            .with_timezone(&Utc),
+        fetched_at: parse_dt(&fetched_str)?,
     })
 }

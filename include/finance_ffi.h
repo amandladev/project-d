@@ -140,25 +140,6 @@ char *list_recurring_transactions(const char *account_id,
 char *delete_recurring_transaction(const char *id);
 
 /**
- * Get a single recurring transaction by ID.
- *
- * # Safety
- * `id` must be a valid C string containing a UUID.
- */
-char *get_recurring_transaction(const char *id);
-
-/**
- * Update a recurring transaction.
- *
- * Pass a JSON object with optional fields: `{"amount": 5000, "description": "...", "is_active": false}`.
- *
- * # Safety
- * All pointer parameters must be valid C strings.
- */
-char *update_recurring_transaction(const char *id,
-                                   const char *update_json);
-
-/**
  * Process due recurring transactions and create actual transactions.
  *
  * # Safety
@@ -202,25 +183,6 @@ char *delete_budget(const char *id);
  * `budget_id` must be a valid C string.
  */
 char *get_budget_progress(const char *budget_id);
-
-/**
- * Get a single budget by ID.
- *
- * # Safety
- * `budget_id` must be a valid C string containing a UUID.
- */
-char *get_budget(const char *budget_id);
-
-/**
- * Update a budget.
- *
- * Pass a JSON object with optional fields: `{"name": "...", "amount": 50000, "period": "monthly"}`.
- *
- * # Safety
- * All pointer parameters must be valid C strings.
- */
-char *update_budget(const char *budget_id,
-                    const char *update_json);
 
 /**
  * Seed bundled default exchange rates into the database. Call once after init_database.
@@ -464,25 +426,6 @@ char *list_accounts(const char *user_id);
 char *delete_account(const char *account_id);
 
 /**
- * Get a single account by ID.
- *
- * # Safety
- * `account_id` must be a valid C string containing a UUID.
- */
-char *get_account(const char *account_id);
-
-/**
- * Update an account's name and/or currency.
- *
- * Pass a JSON object with optional fields: `{"name": "...", "currency": "..."}`.
- *
- * # Safety
- * All pointer parameters must be valid C strings.
- */
-char *update_account(const char *account_id,
-                     const char *update_json);
-
-/**
  * List all categories for a user.
  *
  * # Safety
@@ -497,26 +440,6 @@ char *list_categories(const char *user_id);
  * `category_id` must be a valid C string containing a UUID.
  */
 char *delete_category(const char *category_id);
-
-/**
- * Get a single category by ID.
- *
- * # Safety
- * `category_id` must be a valid C string containing a UUID.
- */
-char *get_category(const char *category_id);
-
-/**
- * Update a category's name and/or icon.
- *
- * Pass a JSON object with optional fields: `{"name": "...", "icon": "..."}`.
- * Set `"icon": null` to remove the icon.
- *
- * # Safety
- * All pointer parameters must be valid C strings.
- */
-char *update_category(const char *category_id,
-                      const char *update_json);
 
 /**
  * Edit an existing transaction.

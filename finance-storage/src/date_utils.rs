@@ -1,4 +1,5 @@
 use chrono::{DateTime, SecondsFormat, Utc};
+use uuid::Uuid;
 
 /// Format a DateTime<Utc> to a fixed-width RFC3339 string suitable for SQLite
 /// text-based date comparisons.
@@ -17,6 +18,44 @@ pub fn format_dt(dt: &DateTime<Utc>) -> String {
 /// Format an optional DateTime<Utc> for SQLite storage.
 pub fn format_dt_opt(dt: &Option<DateTime<Utc>>) -> Option<String> {
     dt.as_ref().map(format_dt)
+}
+
+// ─── Safe Row Parsing Helpers ────────────────────────────────────────────────
+
+/// Parse a UUID string from a database row, returning a `rusqlite::Error` on failure
+/// instead of panicking.
+pub fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(e),
+        )
+    })
+}
+
+/// Parse an optional UUID string from a database row.
+pub fn parse_uuid_opt(s: Option<String>) -> rusqlite::Result<Option<Uuid>> {
+    s.map(|v| parse_uuid(&v)).transpose()
+}
+
+/// Parse an RFC3339 date string into `DateTime<Utc>`, returning a `rusqlite::Error`
+/// on failure instead of panicking.
+pub fn parse_dt(s: &str) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })
+}
+
+/// Parse an optional RFC3339 date string into `Option<DateTime<Utc>>`.
+pub fn parse_dt_opt(s: Option<String>) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    s.map(|v| parse_dt(&v)).transpose()
 }
 
 #[cfg(test)]

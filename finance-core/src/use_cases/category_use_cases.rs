@@ -100,4 +100,33 @@ impl<'a> CategoryUseCases<'a> {
         category.version += 1;
         self.repo.update(&category)
     }
+
+    /// Update a category's name and/or icon.
+    pub fn update_category(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        icon: Option<Option<String>>,
+    ) -> Result<Category, DomainError> {
+        let mut category = self.get_category(id)?;
+
+        if let Some(n) = name {
+            if n.trim().is_empty() {
+                return Err(DomainError::Validation(
+                    "Category name cannot be empty".to_string(),
+                ));
+            }
+            category.name = n;
+        }
+
+        if let Some(i) = icon {
+            category.icon = i;
+        }
+
+        category.base.touch();
+        category.sync_status = crate::entities::SyncStatus::Pending;
+        category.version += 1;
+        self.repo.update(&category)?;
+        Ok(category)
+    }
 }

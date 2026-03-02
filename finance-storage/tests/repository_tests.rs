@@ -771,8 +771,8 @@ mod tests {
         };
 
         let results = search.search_transactions(&filter).unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].description.contains("Coffee"));
+        assert_eq!(results.items.len(), 1);
+        assert!(results.items[0].description.contains("Coffee"));
     }
 
     #[test]
@@ -808,8 +808,8 @@ mod tests {
         };
 
         let results = search.search_transactions(&filter).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].description, "Medium");
+        assert_eq!(results.items.len(), 1);
+        assert_eq!(results.items[0].description, "Medium");
     }
 
     #[test]
@@ -840,8 +840,8 @@ mod tests {
         };
 
         let results = search.search_transactions(&filter).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].description, "Salary");
+        assert_eq!(results.items.len(), 1);
+        assert_eq!(results.items[0].description, "Salary");
     }
 
     #[test]
@@ -872,7 +872,9 @@ mod tests {
             ..Default::default()
         };
         let page1 = search.search_transactions(&filter).unwrap();
-        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.has_more);
+        assert_eq!(page1.total_count, 5);
 
         // Second page
         let filter = TransactionSearchFilter {
@@ -882,7 +884,8 @@ mod tests {
             ..Default::default()
         };
         let page2 = search.search_transactions(&filter).unwrap();
-        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.items.len(), 2);
+        assert!(page2.has_more);
 
         // Third page (partial)
         let filter = TransactionSearchFilter {
@@ -892,7 +895,8 @@ mod tests {
             ..Default::default()
         };
         let page3 = search.search_transactions(&filter).unwrap();
-        assert_eq!(page3.len(), 1);
+        assert_eq!(page3.items.len(), 1);
+        assert!(!page3.has_more);
     }
 
     #[test]
@@ -937,8 +941,8 @@ mod tests {
         };
 
         let results = search.search_transactions(&filter).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].description, "Pizza delivery");
+        assert_eq!(results.items.len(), 1);
+        assert_eq!(results.items[0].description, "Pizza delivery");
     }
 
     // ─── Tag Repository Tests ────────────────────────────────────────────────
@@ -1175,5 +1179,252 @@ mod tests {
         assert_eq!(progress.spent, 50_00);
         assert_eq!(progress.remaining, 50_00);
         assert!((progress.percentage - 50.0).abs() < 0.01);
+    }
+
+    // ─── SQLCipher Encryption Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_encrypted_database_open_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("encrypted.db");
+        let key = "super-secret-key-123";
+
+        // Create encrypted database and write data
+        {
+            let db = Database::open_encrypted(&db_path, key).unwrap();
+            let repo = SqliteUserRepository::new(&db);
+            let user = User::new("Encrypted User".to_string(), "enc@example.com".to_string());
+            repo.save(&user).unwrap();
+        }
+
+        // Reopen with correct key — should find the user
+        {
+            let db = Database::open_encrypted(&db_path, key).unwrap();
+            let repo = SqliteUserRepository::new(&db);
+            let found = repo.find_by_email("enc@example.com").unwrap();
+            assert!(found.is_some());
+            assert_eq!(found.unwrap().name, "Encrypted User");
+        }
+    }
+
+    #[test]
+    fn test_encrypted_database_wrong_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("encrypted2.db");
+
+        // Create with one key
+        {
+            let _db = Database::open_encrypted(&db_path, "correct-key").unwrap();
+        }
+
+        // Reopen with wrong key — should fail
+        let result = Database::open_encrypted(&db_path, "wrong-key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encrypted_database_empty_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("encrypted3.db");
+
+        let result = Database::open_encrypted(&db_path, "");
+        assert!(result.is_err());
+    }
+
+    // ─── Monthly Trends Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_monthly_trends() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+        let stats = StatisticsUseCases::new(&tx_repo);
+
+        let now = Utc::now();
+
+        // Create some transactions in the current month
+        tx_uc.create_transaction(
+            account.id(), category.id(), 100_00,
+            TransactionType::Expense, "Groceries".to_string(), now,
+        ).unwrap();
+        tx_uc.create_transaction(
+            account.id(), category.id(), 50_00,
+            TransactionType::Income, "Refund".to_string(), now,
+        ).unwrap();
+        tx_uc.create_transaction(
+            account.id(), category.id(), 25_00,
+            TransactionType::Expense, "Coffee".to_string(), now,
+        ).unwrap();
+
+        let from = now - Duration::days(30);
+        let to = now + Duration::days(1);
+        let trends = stats.get_monthly_trends(account.id(), from, to).unwrap();
+
+        assert!(!trends.is_empty());
+        let trend = &trends[0];
+        assert_eq!(trend.income, 50_00);
+        assert_eq!(trend.expenses, 125_00);
+        assert_eq!(trend.net, 50_00 - 125_00);
+        assert_eq!(trend.transaction_count, 3);
+    }
+
+    // ─── Daily Spending Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_daily_spending() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+        let stats = StatisticsUseCases::new(&tx_repo);
+
+        let now = Utc::now();
+
+        // Create expenses today
+        tx_uc.create_transaction(
+            account.id(), category.id(), 30_00,
+            TransactionType::Expense, "Lunch".to_string(), now,
+        ).unwrap();
+        tx_uc.create_transaction(
+            account.id(), category.id(), 10_00,
+            TransactionType::Expense, "Snack".to_string(), now,
+        ).unwrap();
+        // Income should not appear in daily spending
+        tx_uc.create_transaction(
+            account.id(), category.id(), 200_00,
+            TransactionType::Income, "Salary".to_string(), now,
+        ).unwrap();
+
+        let from = now - Duration::days(1);
+        let to = now + Duration::days(1);
+        let spending = stats.get_daily_spending(account.id(), from, to).unwrap();
+
+        assert_eq!(spending.len(), 1);
+        assert_eq!(spending[0].amount, 40_00);
+        assert_eq!(spending[0].transaction_count, 2);
+    }
+
+    // ─── Transfer Linking Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_create_transfer_links_two_transactions() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account_a = create_test_account(&db, user.id());
+
+        // Create a second account
+        let account_repo = SqliteAccountRepository::new(&db);
+        let account_uc = AccountUseCases::new(&account_repo);
+        let account_b = account_uc.create_account(user.id(), "Savings".to_string(), "USD".to_string()).unwrap();
+
+        let category = create_test_category(&db, user.id());
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        let now = Utc::now();
+        let (outgoing, incoming) = tx_uc
+            .create_transfer(account_a.id(), account_b.id(), category.id(), 50_00, "To savings".to_string(), now)
+            .unwrap();
+
+        // Outgoing should be Transfer type from account A
+        assert_eq!(outgoing.account_id, account_a.id());
+        assert_eq!(outgoing.amount, 50_00);
+        assert_eq!(outgoing.transaction_type, TransactionType::Transfer);
+        assert_eq!(outgoing.linked_transaction_id, Some(incoming.base.id));
+
+        // Incoming should be Income type in account B
+        assert_eq!(incoming.account_id, account_b.id());
+        assert_eq!(incoming.amount, 50_00);
+        assert_eq!(incoming.transaction_type, TransactionType::Income);
+        assert_eq!(incoming.linked_transaction_id, Some(outgoing.base.id));
+    }
+
+    #[test]
+    fn test_get_linked_transaction() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account_a = create_test_account(&db, user.id());
+
+        let account_repo = SqliteAccountRepository::new(&db);
+        let account_uc = AccountUseCases::new(&account_repo);
+        let account_b = account_uc.create_account(user.id(), "Checking".to_string(), "USD".to_string()).unwrap();
+
+        let category = create_test_category(&db, user.id());
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        let now = Utc::now();
+        let (outgoing, incoming) = tx_uc
+            .create_transfer(account_a.id(), account_b.id(), category.id(), 75_00, "Rent transfer".to_string(), now)
+            .unwrap();
+
+        // Get linked from outgoing side
+        let linked = tx_uc.get_linked_transaction(outgoing.base.id).unwrap();
+        assert!(linked.is_some());
+        assert_eq!(linked.unwrap().base.id, incoming.base.id);
+
+        // Get linked from incoming side
+        let linked2 = tx_uc.get_linked_transaction(incoming.base.id).unwrap();
+        assert!(linked2.is_some());
+        assert_eq!(linked2.unwrap().base.id, outgoing.base.id);
+    }
+
+    #[test]
+    fn test_transfer_same_account_fails() {
+        let db = setup();
+        let user = create_test_user(&db);
+        let account = create_test_account(&db, user.id());
+        let category = create_test_category(&db, user.id());
+
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        let result = tx_uc.create_transfer(
+            account.id(), account.id(), category.id(),
+            50_00, "Self transfer".to_string(), Utc::now(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transfer_balances() {
+        let db = setup();
+        let user = create_test_user(&db);
+
+        let account_repo = SqliteAccountRepository::new(&db);
+        let account_uc = AccountUseCases::new(&account_repo);
+        let account_a = account_uc.create_account(user.id(), "Main".to_string(), "USD".to_string()).unwrap();
+        let account_b = account_uc.create_account(user.id(), "Savings".to_string(), "USD".to_string()).unwrap();
+
+        let category = create_test_category(&db, user.id());
+        let tx_repo = SqliteTransactionRepository::new(&db);
+        let tx_uc = TransactionUseCases::new(&tx_repo);
+
+        // Fund account A first
+        tx_uc.create_transaction(
+            account_a.id(), category.id(), 200_00,
+            TransactionType::Income, "Salary".to_string(), Utc::now(),
+        ).unwrap();
+
+        // Transfer $100 from A to B
+        tx_uc.create_transfer(
+            account_a.id(), account_b.id(), category.id(),
+            100_00, "To savings".to_string(), Utc::now(),
+        ).unwrap();
+
+        // Account A: +200 income, -100 transfer = 100
+        let balance_a = tx_repo.calculate_balance(account_a.id()).unwrap();
+        assert_eq!(balance_a, 100_00);
+
+        // Account B: +100 income from transfer = 100
+        let balance_b = tx_repo.calculate_balance(account_b.id()).unwrap();
+        assert_eq!(balance_b, 100_00);
     }
 }

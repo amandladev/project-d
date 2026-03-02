@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::entities::pagination::{PageRequest, PaginatedResult};
 use crate::entities::{RecurringTransaction, Transaction, TransactionType};
 use crate::errors::DomainError;
 use crate::repositories::{RecurringTransactionRepository, TransactionRepository};
@@ -61,6 +62,15 @@ impl<'a> RecurringTransactionUseCases<'a> {
         account_id: Uuid,
     ) -> Result<Vec<RecurringTransaction>, DomainError> {
         self.recurring_repo.find_by_account_id(account_id)
+    }
+
+    /// List recurring transactions for an account (paginated).
+    pub fn list_recurring_transactions_paginated(
+        &self,
+        account_id: Uuid,
+        page: &PageRequest,
+    ) -> Result<PaginatedResult<RecurringTransaction>, DomainError> {
+        self.recurring_repo.find_by_account_id_paginated(account_id, page)
     }
 
     /// Update a recurring transaction.

@@ -49,6 +49,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
             transaction_type TEXT NOT NULL,
             description TEXT NOT NULL,
             date TEXT NOT NULL,
+            linked_transaction_id TEXT,
             sync_status TEXT NOT NULL DEFAULT 'pending',
             version INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
@@ -106,6 +107,19 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_recurring_transactions_is_active ON recurring_transactions(is_active);
         CREATE INDEX IF NOT EXISTS idx_budgets_account_id ON budgets(account_id);
         CREATE INDEX IF NOT EXISTS idx_budgets_category_id ON budgets(category_id);
+
+        -- Covering index for common account+date queries (stats, date-range, pagination)
+        CREATE INDEX IF NOT EXISTS idx_transactions_account_deleted_date
+            ON transactions(account_id, deleted_at, date);
+
+        -- category_id: JOINs in spending_by_category & budget progress
+        CREATE INDEX IF NOT EXISTS idx_transactions_category_id ON transactions(category_id);
+
+        -- transaction_type: statistics aggregation filters
+        CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(transaction_type);
+
+        -- recurring_transactions: category_id FK lookups
+        CREATE INDEX IF NOT EXISTS idx_recurring_transactions_category_id ON recurring_transactions(category_id);
 
         -- Exchange rates table
         CREATE TABLE IF NOT EXISTS exchange_rates (

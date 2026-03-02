@@ -1,3 +1,4 @@
+use crate::entities::pagination::PaginatedResult;
 use crate::entities::search::TransactionSearchFilter;
 use crate::entities::Transaction;
 use crate::errors::DomainError;
@@ -17,7 +18,7 @@ impl<'a> SearchUseCases<'a> {
     pub fn search_transactions(
         &self,
         filter: &TransactionSearchFilter,
-    ) -> Result<Vec<Transaction>, DomainError> {
+    ) -> Result<PaginatedResult<Transaction>, DomainError> {
         // Validate filter
         if let (Some(min), Some(max)) = (filter.min_amount, filter.max_amount) {
             if min > max {

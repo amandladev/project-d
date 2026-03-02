@@ -1,5 +1,6 @@
 use uuid::Uuid;
 
+use crate::entities::pagination::{PageRequest, PaginatedResult};
 use crate::entities::Tag;
 use crate::errors::DomainError;
 use crate::repositories::TagRepository;
@@ -120,5 +121,14 @@ impl<'a> TagUseCases<'a> {
     /// Get all transaction IDs that have a given tag.
     pub fn get_transactions_by_tag(&self, tag_id: Uuid) -> Result<Vec<Uuid>, DomainError> {
         self.repo.find_transaction_ids_by_tag(tag_id)
+    }
+
+    /// Get paginated transaction IDs that have a given tag.
+    pub fn get_transactions_by_tag_paginated(
+        &self,
+        tag_id: Uuid,
+        page: &PageRequest,
+    ) -> Result<PaginatedResult<Uuid>, DomainError> {
+        self.repo.find_transaction_ids_by_tag_paginated(tag_id, page)
     }
 }

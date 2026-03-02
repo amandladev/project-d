@@ -1,6 +1,7 @@
 use uuid::Uuid;
 
 use crate::entities::Tag;
+use crate::entities::pagination::{PageRequest, PaginatedResult};
 use crate::errors::DomainError;
 
 /// Repository trait for Tag persistence.
@@ -39,4 +40,11 @@ pub trait TagRepository: Send + Sync {
 
     /// Get all transaction IDs that have a given tag.
     fn find_transaction_ids_by_tag(&self, tag_id: Uuid) -> Result<Vec<Uuid>, DomainError>;
+
+    /// Get paginated transaction IDs that have a given tag.
+    fn find_transaction_ids_by_tag_paginated(
+        &self,
+        tag_id: Uuid,
+        page: &PageRequest,
+    ) -> Result<PaginatedResult<Uuid>, DomainError>;
 }

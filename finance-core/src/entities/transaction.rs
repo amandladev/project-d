@@ -16,6 +16,8 @@ pub struct Transaction {
     pub transaction_type: TransactionType,
     pub description: String,
     pub date: DateTime<Utc>,
+    /// For transfers: the ID of the paired transaction on the other account.
+    pub linked_transaction_id: Option<Uuid>,
     pub sync_status: SyncStatus,
     pub version: i64,
 }
@@ -41,6 +43,7 @@ impl Transaction {
             transaction_type,
             description,
             date,
+            linked_transaction_id: None,
             sync_status: SyncStatus::Pending,
             version: 1,
         })
@@ -91,16 +94,10 @@ impl Transaction {
     }
 
     /// Validate amount based on transaction type.
-    fn validate_amount(amount: i64, tx_type: TransactionType) -> Result<(), DomainError> {
+    fn validate_amount(amount: i64, _tx_type: TransactionType) -> Result<(), DomainError> {
         if amount <= 0 {
             return Err(DomainError::InvalidAmount(
                 "Amount must be greater than zero".to_string(),
-            ));
-        }
-        // Transfers must also be positive (they represent the value being moved)
-        if tx_type == TransactionType::Transfer && amount <= 0 {
-            return Err(DomainError::InvalidAmount(
-                "Transfer amount must be positive".to_string(),
             ));
         }
         Ok(())

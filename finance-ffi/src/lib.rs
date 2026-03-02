@@ -3,9 +3,11 @@ use std::os::raw::c_char;
 use std::path::Path;
 
 use finance_core::entities::{TransactionType, User};
+use finance_core::entities::pagination::PageRequest;
 use finance_core::entities::search::TransactionSearchFilter;
 use finance_core::repositories::{
-    AccountRepository, CategoryRepository, TransactionRepository,
+    AccountRepository, BudgetRepository, CategoryRepository,
+    RecurringTransactionRepository, TransactionRepository,
     UserRepository,
 };
 use finance_core::use_cases::{
@@ -75,17 +77,129 @@ impl FfiResult {
 
 fn get_db() -> Result<&'static Database, FfiResult> {
     DB.get().ok_or_else(|| {
-        FfiResult::error(1, "Database not initialized. Call init_database first.".to_string())
+        FfiResult::error(ERR_DB_NOT_INIT, "Database not initialized. Call init_database first.".to_string())
     })
 }
 
 unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Result<&'a str, FfiResult> {
     if ptr.is_null() {
-        return Err(FfiResult::error(2, "Null pointer received".to_string()));
+        return Err(FfiResult::error(ERR_NULL_PTR, "Null pointer received".to_string()));
     }
     CStr::from_ptr(ptr)
         .to_str()
-        .map_err(|_| FfiResult::error(2, "Invalid UTF-8 string".to_string()))
+        .map_err(|_| FfiResult::error(ERR_NULL_PTR, "Invalid UTF-8 string".to_string()))
+}
+
+// ─── Error Code Constants ────────────────────────────────────────────────────
+
+/// Infrastructure / input errors
+const ERR_DB_NOT_INIT: i32 = 1;
+const ERR_NULL_PTR: i32 = 2;
+const ERR_INVALID_INPUT: i32 = 3;
+const ERR_SERIALIZATION: i32 = 4;
+
+/// Database init errors
+const ERR_DB_OPEN: i32 = 10;
+const ERR_DB_ALREADY_INIT: i32 = 11;
+
+/// Domain errors — accounts
+const ERR_ACCOUNT: i32 = 20;
+
+/// Domain errors — categories
+const ERR_CATEGORY: i32 = 21;
+
+/// Domain errors — transactions
+const ERR_TRANSACTION: i32 = 22;
+const ERR_BALANCE: i32 = 23;
+
+/// Domain errors — users
+const ERR_USER: i32 = 24;
+
+/// Domain errors — sync / statistics
+const ERR_SYNC: i32 = 30;
+const ERR_INCOME_EXPENSES: i32 = 31;
+
+/// Domain errors — recurring transactions
+const ERR_RECURRING_CREATE: i32 = 40;
+const ERR_RECURRING_LIST: i32 = 41;
+const ERR_RECURRING_DELETE: i32 = 42;
+const ERR_RECURRING_PROCESS: i32 = 43;
+const ERR_RECURRING_UPDATE: i32 = 44;
+const ERR_RECURRING_GET: i32 = 45;
+
+/// Domain errors — budgets
+const ERR_BUDGET_CREATE: i32 = 50;
+const ERR_BUDGET_LIST: i32 = 51;
+const ERR_BUDGET_DELETE: i32 = 52;
+const ERR_BUDGET_PROGRESS: i32 = 53;
+const ERR_BUDGET_UPDATE: i32 = 54;
+const ERR_BUDGET_GET: i32 = 55;
+
+/// Domain errors — currency / exchange rates
+const ERR_RATES_SEED: i32 = 60;
+const ERR_RATES_UPDATE: i32 = 61;
+const ERR_RATES_MANUAL: i32 = 62;
+const ERR_CURRENCY_CONVERT: i32 = 63;
+const ERR_RATE_FRESHNESS: i32 = 64;
+const ERR_RATES_LIST: i32 = 65;
+
+/// Domain errors — search / transfers
+const ERR_SEARCH: i32 = 70;
+const ERR_LINKED_TX: i32 = 71;
+
+/// Domain errors — tags
+const ERR_TAG_CREATE: i32 = 80;
+const ERR_TAG_LIST: i32 = 81;
+const ERR_TAG_UPDATE: i32 = 82;
+const ERR_TAG_DELETE: i32 = 83;
+const ERR_TAG_ADD: i32 = 84;
+const ERR_TAG_REMOVE: i32 = 85;
+const ERR_TAG_GET_TX: i32 = 86;
+const ERR_TAG_BY_TAG: i32 = 87;
+
+/// Domain errors — statistics (spending trends)
+const ERR_MONTHLY_TRENDS: i32 = 60;
+const ERR_DAILY_SPENDING: i32 = 61;
+
+// ─── FFI Macros ──────────────────────────────────────────────────────────────
+
+/// Wraps an FFI function body with the standard Result closure + dispatch pattern.
+/// Eliminates the 4-line match boilerplate from every function.
+macro_rules! ffi_body {
+    ($body:block) => {{
+        let result = (|| -> Result<FfiResult, FfiResult> { $body })();
+        match result {
+            Ok(r) | Err(r) => r.to_json_cstring(),
+        }
+    }};
+}
+
+/// Parse a UUID from a C string pointer, returning ERR_INVALID_INPUT on failure.
+macro_rules! parse_uuid_ffi {
+    ($ptr:expr, $label:expr) => {{
+        let s = cstr_to_str($ptr)?;
+        Uuid::parse_str(s)
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, format!("Invalid {} UUID", $label)))?
+    }};
+}
+
+/// Serialize a value to JSON and wrap in FfiResult::ok, or return ERR_SERIALIZATION on failure.
+macro_rules! ok_json {
+    ($val:expr) => {{
+        let data = serde_json::to_value(&$val)
+            .map_err(|e| FfiResult::error(ERR_SERIALIZATION, format!("Serialization error: {e}")))?;
+        Ok(FfiResult::ok(data))
+    }};
+}
+
+/// Build a PageRequest from limit/offset i64 parameters.
+macro_rules! page_request {
+    ($limit:expr, $offset:expr) => {
+        PageRequest {
+            limit: if $limit > 0 { $limit as usize } else { 50 },
+            offset: if $offset >= 0 { $offset as usize } else { 0 },
+        }
+    };
 }
 
 // ─── FFI Functions ───────────────────────────────────────────────────────────
@@ -96,19 +210,36 @@ unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Result<&'a str, FfiResult> {
 /// `path` must be a valid C string pointer.
 #[no_mangle]
 pub unsafe extern "C" fn init_database(path: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let path_str = cstr_to_str(path)?;
         let db = Database::open(Path::new(path_str))
-            .map_err(|e| FfiResult::error(10, format!("Failed to open database: {e}")))?;
+            .map_err(|e| FfiResult::error(ERR_DB_OPEN, format!("Failed to open database: {e}")))?;
         DB.set(db)
-            .map_err(|_| FfiResult::error(11, "Database already initialized".to_string()))?;
+            .map_err(|_| FfiResult::error(ERR_DB_ALREADY_INIT, "Database already initialized".to_string()))?;
         Ok(FfiResult::ok_empty())
-    })();
+    })
+}
 
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+/// Initialize an encrypted database (SQLCipher) at the given path.
+/// Must be called before any other function. The key is the encryption passphrase.
+/// On first use, creates an encrypted DB. On subsequent uses, decrypts it.
+///
+/// # Safety
+/// `path` and `key` must be valid C string pointers.
+#[no_mangle]
+pub unsafe extern "C" fn init_database_encrypted(
+    path: *const c_char,
+    key: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let path_str = cstr_to_str(path)?;
+        let key_str = cstr_to_str(key)?;
+        let db = Database::open_encrypted(Path::new(path_str), key_str)
+            .map_err(|e| FfiResult::error(ERR_DB_OPEN, format!("Failed to open encrypted database: {e}")))?;
+        DB.set(db)
+            .map_err(|_| FfiResult::error(ERR_DB_ALREADY_INIT, "Database already initialized".to_string()))?;
+        Ok(FfiResult::ok_empty())
+    })
 }
 
 /// Create a new account.
@@ -121,32 +252,22 @@ pub unsafe extern "C" fn create_account(
     name: *const c_char,
     currency: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
         let name_str = cstr_to_str(name)?;
         let currency_str = cstr_to_str(currency)?;
 
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteAccountRepository::new(db);
         let use_cases = AccountUseCases::new(&repo);
 
         let account = use_cases
             .create_account(user_uuid, name_str.to_string(), currency_str.to_string())
-            .map_err(|e| FfiResult::error(20, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_ACCOUNT, format!("{e}")))?;
 
-        let data = serde_json::to_value(&account)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(account)
+    })
 }
 
 /// Create a new category.
@@ -159,9 +280,8 @@ pub unsafe extern "C" fn create_category(
     name: *const c_char,
     icon: *const c_char, // can be null
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
         let name_str = cstr_to_str(name)?;
         let icon_str = if icon.is_null() {
             None
@@ -169,26 +289,17 @@ pub unsafe extern "C" fn create_category(
             Some(cstr_to_str(icon)?.to_string())
         };
 
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteCategoryRepository::new(db);
         let use_cases = CategoryUseCases::new(&repo);
 
         let category = use_cases
             .create_category(user_uuid, name_str.to_string(), icon_str)
-            .map_err(|e| FfiResult::error(21, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_CATEGORY, format!("{e}")))?;
 
-        let data = serde_json::to_value(&category)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(category)
+    })
 }
 
 /// Seed default categories for a user if none exist yet.
@@ -198,28 +309,18 @@ pub unsafe extern "C" fn create_category(
 /// `user_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn seed_default_categories(user_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteCategoryRepository::new(db);
         let use_cases = CategoryUseCases::new(&repo);
         let categories = use_cases
             .seed_default_categories(user_uuid)
-            .map_err(|e| FfiResult::error(21, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_CATEGORY, format!("{e}")))?;
 
-        let data = serde_json::to_value(&categories)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(categories)
+    })
 }
 
 /// Create a new transaction.
@@ -237,22 +338,18 @@ pub unsafe extern "C" fn create_transaction(
     description: *const c_char,
     date: *const c_char, // RFC3339 formatted date string
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
-        let category_id_str = cstr_to_str(category_id)?;
         let type_str = cstr_to_str(transaction_type)?;
         let desc_str = cstr_to_str(description)?;
         let date_str = cstr_to_str(date)?;
 
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
-        let category_uuid = Uuid::parse_str(category_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid category_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
+        let category_uuid = parse_uuid_ffi!(category_id, "category_id");
         let tx_type = TransactionType::from_str(type_str)
-            .ok_or_else(|| FfiResult::error(3, "Invalid transaction_type".to_string()))?;
+            .ok_or_else(|| FfiResult::error(ERR_INVALID_INPUT, "Invalid transaction_type".to_string()))?;
         let parsed_date = chrono::DateTime::parse_from_rfc3339(date_str)
-            .map_err(|_| FfiResult::error(3, "Invalid date format (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid date format (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
 
         let repo = SqliteTransactionRepository::new(db);
@@ -267,18 +364,10 @@ pub unsafe extern "C" fn create_transaction(
                 desc_str.to_string(),
                 parsed_date,
             )
-            .map_err(|e| FfiResult::error(22, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TRANSACTION, format!("{e}")))?;
 
-        let data = serde_json::to_value(&transaction)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(transaction)
+    })
 }
 
 /// Get the balance for an account (in cents).
@@ -287,33 +376,25 @@ pub unsafe extern "C" fn create_transaction(
 /// `account_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn get_balance(account_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
-
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
 
         let repo = SqliteTransactionRepository::new(db);
         let use_cases = TransactionUseCases::new(&repo);
 
         let balance = use_cases
             .get_balance(account_uuid)
-            .map_err(|e| FfiResult::error(23, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_BALANCE, format!("{e}")))?;
 
         Ok(FfiResult::ok(serde_json::json!({ "balance": balance })))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Get pending sync changes as JSON.
 #[no_mangle]
 pub extern "C" fn get_pending_sync() -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
 
         let account_repo = SqliteAccountRepository::new(db);
@@ -322,13 +403,13 @@ pub extern "C" fn get_pending_sync() -> *mut c_char {
 
         let accounts = account_repo
             .find_pending_sync()
-            .map_err(|e| FfiResult::error(30, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_SYNC, format!("{e}")))?;
         let categories = category_repo
             .find_pending_sync()
-            .map_err(|e| FfiResult::error(30, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_SYNC, format!("{e}")))?;
         let transactions = transaction_repo
             .find_pending_sync()
-            .map_err(|e| FfiResult::error(30, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_SYNC, format!("{e}")))?;
 
         let data = serde_json::json!({
             "accounts": accounts,
@@ -337,12 +418,7 @@ pub extern "C" fn get_pending_sync() -> *mut c_char {
         });
 
         Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Get spending aggregated by category for an account within a date range.
@@ -355,37 +431,27 @@ pub unsafe extern "C" fn get_spending_by_category(
     from: *const c_char,
     to: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
         let from_str = cstr_to_str(from)?;
         let to_str = cstr_to_str(to)?;
 
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
         let from_date = chrono::DateTime::parse_from_rfc3339(from_str)
-            .map_err(|_| FfiResult::error(3, "Invalid from date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid from date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
         let to_date = chrono::DateTime::parse_from_rfc3339(to_str)
-            .map_err(|_| FfiResult::error(3, "Invalid to date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid to date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
 
         let repo = SqliteTransactionRepository::new(db);
         let use_cases = StatisticsUseCases::new(&repo);
         let spending = use_cases
             .get_spending_by_category(account_uuid, from_date, to_date)
-            .map_err(|e| FfiResult::error(30, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_SYNC, format!("{e}")))?;
 
-        let data = serde_json::to_value(&spending)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(spending)
+    })
 }
 
 /// Get income vs expenses summary for an account within a date range.
@@ -398,37 +464,27 @@ pub unsafe extern "C" fn get_income_vs_expenses(
     from: *const c_char,
     to: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
         let from_str = cstr_to_str(from)?;
         let to_str = cstr_to_str(to)?;
 
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
         let from_date = chrono::DateTime::parse_from_rfc3339(from_str)
-            .map_err(|_| FfiResult::error(3, "Invalid from date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid from date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
         let to_date = chrono::DateTime::parse_from_rfc3339(to_str)
-            .map_err(|_| FfiResult::error(3, "Invalid to date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid to date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
 
         let repo = SqliteTransactionRepository::new(db);
         let use_cases = StatisticsUseCases::new(&repo);
         let summary = use_cases
             .get_income_vs_expenses(account_uuid, from_date, to_date)
-            .map_err(|e| FfiResult::error(31, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_INCOME_EXPENSES, format!("{e}")))?;
 
-        let data = serde_json::to_value(&summary)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(summary)
+    })
 }
 
 // ─── Recurring Transaction Functions ─────────────────────────────────────────
@@ -448,23 +504,19 @@ pub unsafe extern "C" fn create_recurring_transaction(
     start_date: *const c_char,
     end_date: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
-        let category_id_str = cstr_to_str(category_id)?;
         let tx_type_str = cstr_to_str(transaction_type)?;
         let desc_str = cstr_to_str(description)?;
         let freq_str = cstr_to_str(frequency)?;
         let start_str = cstr_to_str(start_date)?;
 
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
-        let category_uuid = Uuid::parse_str(category_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid category_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
+        let category_uuid = parse_uuid_ffi!(category_id, "category_id");
         let tx_type = TransactionType::from_str(tx_type_str)
-            .ok_or_else(|| FfiResult::error(3, "Invalid transaction_type".to_string()))?;
+            .ok_or_else(|| FfiResult::error(ERR_INVALID_INPUT, "Invalid transaction_type".to_string()))?;
         let start_dt = chrono::DateTime::parse_from_rfc3339(start_str)
-            .map_err(|_| FfiResult::error(3, "Invalid start_date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid start_date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
 
         let end_dt = if !end_date.is_null() {
@@ -472,7 +524,7 @@ pub unsafe extern "C" fn create_recurring_transaction(
             Some(
                 chrono::DateTime::parse_from_rfc3339(end_str)
                     .map_err(|_| {
-                        FfiResult::error(3, "Invalid end_date (expected RFC3339)".to_string())
+                        FfiResult::error(ERR_INVALID_INPUT, "Invalid end_date (expected RFC3339)".to_string())
                     })?
                     .with_timezone(&chrono::Utc),
             )
@@ -495,51 +547,38 @@ pub unsafe extern "C" fn create_recurring_transaction(
                 start_dt,
                 end_dt,
             )
-            .map_err(|e| FfiResult::error(40, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RECURRING_CREATE, format!("{e}")))?;
 
-        let data = serde_json::to_value(&recurring)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(recurring)
+    })
 }
 
-/// List recurring transactions for an account.
+/// List recurring transactions for an account (paginated).
 ///
 /// # Safety
 /// `account_id` must be a valid C string.
 #[no_mangle]
-pub unsafe extern "C" fn list_recurring_transactions(account_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+pub unsafe extern "C" fn list_recurring_transactions(
+    account_id: *const c_char,
+    limit: i64,
+    offset: i64,
+) -> *mut c_char {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
 
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let page = page_request!(limit, offset);
 
         let recurring_repo = SqliteRecurringTransactionRepository::new(db);
         let transaction_repo = SqliteTransactionRepository::new(db);
         let use_cases = RecurringTransactionUseCases::new(&recurring_repo, &transaction_repo);
 
-        let recurrings = use_cases
-            .list_recurring_transactions(account_uuid)
-            .map_err(|e| FfiResult::error(41, format!("{e}")))?;
+        let paginated = use_cases
+            .list_recurring_transactions_paginated(account_uuid, &page)
+            .map_err(|e| FfiResult::error(ERR_RECURRING_LIST, format!("{e}")))?;
 
-        let data = serde_json::to_value(&recurrings)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(paginated)
+    })
 }
 
 /// Delete a recurring transaction.
@@ -548,12 +587,9 @@ pub unsafe extern "C" fn list_recurring_transactions(account_id: *const c_char) 
 /// `id` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn delete_recurring_transaction(id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let id_str = cstr_to_str(id)?;
-
-        let uuid = Uuid::parse_str(id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid id UUID".to_string()))?;
+        let uuid = parse_uuid_ffi!(id, "id");
 
         let recurring_repo = SqliteRecurringTransactionRepository::new(db);
         let transaction_repo = SqliteTransactionRepository::new(db);
@@ -561,15 +597,81 @@ pub unsafe extern "C" fn delete_recurring_transaction(id: *const c_char) -> *mut
 
         use_cases
             .delete_recurring_transaction(uuid)
-            .map_err(|e| FfiResult::error(42, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RECURRING_DELETE, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
+    })
+}
 
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+/// Get a single recurring transaction by ID.
+///
+/// # Safety
+/// `id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn get_recurring_transaction(id: *const c_char) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let uuid = parse_uuid_ffi!(id, "id");
+
+        let recurring_repo = SqliteRecurringTransactionRepository::new(db);
+        let recurring = recurring_repo
+            .find_by_id(uuid)
+            .map_err(|e| FfiResult::error(ERR_RECURRING_GET, format!("{e}")))?
+            .ok_or_else(|| FfiResult::error(ERR_RECURRING_GET, "Recurring transaction not found".to_string()))?;
+
+        ok_json!(recurring)
+    })
+}
+
+/// Update a recurring transaction.
+///
+/// Pass a JSON object with optional fields: `{"amount": 5000, "description": "...", "is_active": false}`.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn update_recurring_transaction(
+    id: *const c_char,
+    update_json: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let uuid = parse_uuid_ffi!(id, "id");
+        let json_str = cstr_to_str(update_json)?;
+
+        let update: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| FfiResult::error(ERR_INVALID_INPUT, format!("Invalid JSON: {e}")))?;
+
+        let recurring_repo = SqliteRecurringTransactionRepository::new(db);
+        let transaction_repo = SqliteTransactionRepository::new(db);
+        let use_cases = RecurringTransactionUseCases::new(&recurring_repo, &transaction_repo);
+
+        let mut recurring = recurring_repo
+            .find_by_id(uuid)
+            .map_err(|e| FfiResult::error(ERR_RECURRING_UPDATE, format!("{e}")))?
+            .ok_or_else(|| FfiResult::error(ERR_RECURRING_UPDATE, "Recurring transaction not found".to_string()))?;
+
+        if let Some(amount) = update.get("amount").and_then(|v| v.as_i64()) {
+            recurring.amount = amount;
+        }
+        if let Some(desc) = update.get("description").and_then(|v| v.as_str()) {
+            recurring.description = desc.to_string();
+        }
+        if let Some(active) = update.get("is_active").and_then(|v| v.as_bool()) {
+            recurring.is_active = active;
+        }
+        if let Some(category_id_str) = update.get("category_id").and_then(|v| v.as_str()) {
+            recurring.category_id = Uuid::parse_str(category_id_str)
+                .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid category_id UUID".to_string()))?;
+        }
+
+        recurring.base.touch();
+        use_cases
+            .update_recurring_transaction(&recurring)
+            .map_err(|e| FfiResult::error(ERR_RECURRING_UPDATE, format!("{e}")))?;
+
+        ok_json!(recurring)
+    })
 }
 
 /// Process due recurring transactions and create actual transactions.
@@ -578,7 +680,7 @@ pub unsafe extern "C" fn delete_recurring_transaction(id: *const c_char) -> *mut
 /// This function is safe to call.
 #[no_mangle]
 pub unsafe extern "C" fn process_due_recurring_transactions() -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
 
         let recurring_repo = SqliteRecurringTransactionRepository::new(db);
@@ -587,18 +689,10 @@ pub unsafe extern "C" fn process_due_recurring_transactions() -> *mut c_char {
 
         let created_ids = use_cases
             .process_due_recurring_transactions()
-            .map_err(|e| FfiResult::error(43, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RECURRING_PROCESS, format!("{e}")))?;
 
-        let data = serde_json::to_value(&created_ids)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(created_ids)
+    })
 }
 
 // ─── Budget Functions ────────────────────────────────────────────────────────
@@ -616,28 +710,22 @@ pub unsafe extern "C" fn create_budget(
     period: *const c_char,
     start_date: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
         let name_str = cstr_to_str(name)?;
         let period_str = cstr_to_str(period)?;
         let start_str = cstr_to_str(start_date)?;
 
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
 
         let category_uuid = if !category_id.is_null() {
-            let cat_str = cstr_to_str(category_id)?;
-            Some(
-                Uuid::parse_str(cat_str)
-                    .map_err(|_| FfiResult::error(3, "Invalid category_id UUID".to_string()))?,
-            )
+            Some(parse_uuid_ffi!(category_id, "category_id"))
         } else {
             None
         };
 
         let start_dt = chrono::DateTime::parse_from_rfc3339(start_str)
-            .map_err(|_| FfiResult::error(3, "Invalid start_date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid start_date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
 
         let budget_repo = SqliteBudgetRepository::new(db);
@@ -653,18 +741,10 @@ pub unsafe extern "C" fn create_budget(
                 period_str,
                 start_dt,
             )
-            .map_err(|e| FfiResult::error(50, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_BUDGET_CREATE, format!("{e}")))?;
 
-        let data = serde_json::to_value(&budget)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(budget)
+    })
 }
 
 /// List budgets for an account.
@@ -673,12 +753,9 @@ pub unsafe extern "C" fn create_budget(
 /// `account_id` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn list_budgets(account_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
-
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
 
         let budget_repo = SqliteBudgetRepository::new(db);
         let transaction_repo = SqliteTransactionRepository::new(db);
@@ -686,18 +763,10 @@ pub unsafe extern "C" fn list_budgets(account_id: *const c_char) -> *mut c_char 
 
         let budgets = use_cases
             .list_budgets(account_uuid)
-            .map_err(|e| FfiResult::error(51, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_BUDGET_LIST, format!("{e}")))?;
 
-        let data = serde_json::to_value(&budgets)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(budgets)
+    })
 }
 
 /// Delete a budget.
@@ -706,12 +775,9 @@ pub unsafe extern "C" fn list_budgets(account_id: *const c_char) -> *mut c_char 
 /// `id` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn delete_budget(id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let id_str = cstr_to_str(id)?;
-
-        let uuid = Uuid::parse_str(id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid id UUID".to_string()))?;
+        let uuid = parse_uuid_ffi!(id, "id");
 
         let budget_repo = SqliteBudgetRepository::new(db);
         let transaction_repo = SqliteTransactionRepository::new(db);
@@ -719,15 +785,10 @@ pub unsafe extern "C" fn delete_budget(id: *const c_char) -> *mut c_char {
 
         use_cases
             .delete_budget(uuid)
-            .map_err(|e| FfiResult::error(52, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_BUDGET_DELETE, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Get budget progress for a specific budget.
@@ -736,12 +797,9 @@ pub unsafe extern "C" fn delete_budget(id: *const c_char) -> *mut c_char {
 /// `budget_id` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn get_budget_progress(budget_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let budget_id_str = cstr_to_str(budget_id)?;
-
-        let budget_uuid = Uuid::parse_str(budget_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid budget_id UUID".to_string()))?;
+        let budget_uuid = parse_uuid_ffi!(budget_id, "budget_id");
 
         let budget_repo = SqliteBudgetRepository::new(db);
         let transaction_repo = SqliteTransactionRepository::new(db);
@@ -749,18 +807,78 @@ pub unsafe extern "C" fn get_budget_progress(budget_id: *const c_char) -> *mut c
 
         let progress = use_cases
             .get_budget_progress(budget_uuid)
-            .map_err(|e| FfiResult::error(53, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_BUDGET_PROGRESS, format!("{e}")))?;
 
-        let data = serde_json::to_value(&progress)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+        ok_json!(progress)
+    })
+}
 
-        Ok(FfiResult::ok(data))
-    })();
+/// Get a single budget by ID.
+///
+/// # Safety
+/// `budget_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn get_budget(budget_id: *const c_char) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let budget_uuid = parse_uuid_ffi!(budget_id, "budget_id");
 
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        let budget_repo = SqliteBudgetRepository::new(db);
+        let budget = budget_repo
+            .find_by_id(budget_uuid)
+            .map_err(|e| FfiResult::error(ERR_BUDGET_GET, format!("{e}")))?
+            .ok_or_else(|| FfiResult::error(ERR_BUDGET_GET, "Budget not found".to_string()))?;
+
+        ok_json!(budget)
+    })
+}
+
+/// Update a budget.
+///
+/// Pass a JSON object with optional fields: `{"name": "...", "amount": 50000, "period": "monthly"}`.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn update_budget(
+    budget_id: *const c_char,
+    update_json: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let budget_uuid = parse_uuid_ffi!(budget_id, "budget_id");
+        let json_str = cstr_to_str(update_json)?;
+
+        let update: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| FfiResult::error(ERR_INVALID_INPUT, format!("Invalid JSON: {e}")))?;
+
+        let budget_repo = SqliteBudgetRepository::new(db);
+        let transaction_repo = SqliteTransactionRepository::new(db);
+        let use_cases = BudgetUseCases::new(&budget_repo, &transaction_repo);
+
+        let mut budget = budget_repo
+            .find_by_id(budget_uuid)
+            .map_err(|e| FfiResult::error(ERR_BUDGET_UPDATE, format!("{e}")))?
+            .ok_or_else(|| FfiResult::error(ERR_BUDGET_UPDATE, "Budget not found".to_string()))?;
+
+        if let Some(name) = update.get("name").and_then(|v| v.as_str()) {
+            budget.name = name.to_string();
+        }
+        if let Some(amount) = update.get("amount").and_then(|v| v.as_i64()) {
+            budget.amount = amount;
+        }
+        if let Some(period_str) = update.get("period").and_then(|v| v.as_str()) {
+            budget.period = finance_core::entities::BudgetPeriod::from_str(period_str)
+                .ok_or_else(|| FfiResult::error(ERR_INVALID_INPUT, "Invalid budget period".to_string()))?;
+        }
+
+        budget.base.touch();
+        use_cases
+            .update_budget(&budget)
+            .map_err(|e| FfiResult::error(ERR_BUDGET_UPDATE, format!("{e}")))?;
+
+        ok_json!(budget)
+    })
 }
 
 // ─── Currency Conversion Functions ───────────────────────────────────────────
@@ -771,22 +889,17 @@ pub unsafe extern "C" fn get_budget_progress(budget_id: *const c_char) -> *mut c
 /// Database must be initialized.
 #[no_mangle]
 pub unsafe extern "C" fn seed_exchange_rates() -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let repo = SqliteExchangeRateRepository::new(db);
         let use_cases = CurrencyUseCases::new(&repo);
 
         let count = use_cases
             .seed_bundled_rates()
-            .map_err(|e| FfiResult::error(60, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RATES_SEED, format!("{e}")))?;
 
         Ok(FfiResult::ok(serde_json::json!({ "seeded": count })))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Update cached exchange rates from external API data.
@@ -796,7 +909,7 @@ pub unsafe extern "C" fn seed_exchange_rates() -> *mut c_char {
 /// `rates_json` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn update_exchange_rates(rates_json: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let json_str = cstr_to_str(rates_json)?;
 
@@ -805,15 +918,10 @@ pub unsafe extern "C" fn update_exchange_rates(rates_json: *const c_char) -> *mu
 
         let count = use_cases
             .update_cached_rates(json_str)
-            .map_err(|e| FfiResult::error(61, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RATES_UPDATE, format!("{e}")))?;
 
         Ok(FfiResult::ok(serde_json::json!({ "updated": count })))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Set a manual exchange rate (user override — highest priority).
@@ -826,7 +934,7 @@ pub unsafe extern "C" fn set_manual_exchange_rate(
     to_currency: *const c_char,
     rate: f64,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let from_str = cstr_to_str(from_currency)?;
         let to_str = cstr_to_str(to_currency)?;
@@ -836,18 +944,10 @@ pub unsafe extern "C" fn set_manual_exchange_rate(
 
         let exchange_rate = use_cases
             .set_manual_rate(from_str, to_str, rate)
-            .map_err(|e| FfiResult::error(62, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RATES_MANUAL, format!("{e}")))?;
 
-        let data = serde_json::to_value(&exchange_rate)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(exchange_rate)
+    })
 }
 
 /// Convert an amount between currencies using the 3-tier rate resolution.
@@ -860,7 +960,7 @@ pub unsafe extern "C" fn convert_currency(
     from_currency: *const c_char,
     to_currency: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let from_str = cstr_to_str(from_currency)?;
         let to_str = cstr_to_str(to_currency)?;
@@ -870,18 +970,10 @@ pub unsafe extern "C" fn convert_currency(
 
         let conversion = use_cases
             .convert(amount_cents, from_str, to_str)
-            .map_err(|e| FfiResult::error(63, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_CURRENCY_CONVERT, format!("{e}")))?;
 
-        let data = serde_json::to_value(&conversion)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(conversion)
+    })
 }
 
 /// Get rate freshness info for a currency pair.
@@ -893,7 +985,7 @@ pub unsafe extern "C" fn get_rate_freshness(
     from_currency: *const c_char,
     to_currency: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let from_str = cstr_to_str(from_currency)?;
         let to_str = cstr_to_str(to_currency)?;
@@ -903,18 +995,10 @@ pub unsafe extern "C" fn get_rate_freshness(
 
         let freshness = use_cases
             .get_rate_freshness(from_str, to_str)
-            .map_err(|e| FfiResult::error(64, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RATE_FRESHNESS, format!("{e}")))?;
 
-        let data = serde_json::to_value(&freshness)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(freshness)
+    })
 }
 
 /// List all exchange rates from a base currency.
@@ -923,7 +1007,7 @@ pub unsafe extern "C" fn get_rate_freshness(
 /// `from_currency` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn list_exchange_rates(from_currency: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let from_str = cstr_to_str(from_currency)?;
 
@@ -932,18 +1016,10 @@ pub unsafe extern "C" fn list_exchange_rates(from_currency: *const c_char) -> *m
 
         let rates = use_cases
             .list_rates(from_str)
-            .map_err(|e| FfiResult::error(65, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_RATES_LIST, format!("{e}")))?;
 
-        let data = serde_json::to_value(&rates)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(rates)
+    })
 }
 
 // ─── Search & Filtering ──────────────────────────────────────────────────────
@@ -962,30 +1038,22 @@ pub unsafe extern "C" fn list_exchange_rates(from_currency: *const c_char) -> *m
 /// `filter_json` must be a valid C string containing JSON.
 #[no_mangle]
 pub unsafe extern "C" fn search_transactions(filter_json: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let json_str = cstr_to_str(filter_json)?;
 
         let filter: TransactionSearchFilter = serde_json::from_str(json_str)
-            .map_err(|e| FfiResult::error(3, format!("Invalid filter JSON: {e}")))?;
+            .map_err(|e| FfiResult::error(ERR_INVALID_INPUT, format!("Invalid filter JSON: {e}")))?;
 
         let repo = SqliteTransactionRepository::new(db);
         let use_cases = SearchUseCases::new(&repo);
 
-        let transactions = use_cases
+        let paginated = use_cases
             .search_transactions(&filter)
-            .map_err(|e| FfiResult::error(70, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_SEARCH, format!("{e}")))?;
 
-        let data = serde_json::to_value(&transactions)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(paginated)
+    })
 }
 
 // ─── Tag Functions ───────────────────────────────────────────────────────────
@@ -1000,9 +1068,8 @@ pub unsafe extern "C" fn create_tag(
     name: *const c_char,
     color: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
         let name_str = cstr_to_str(name)?;
         let color_str = if color.is_null() {
             None
@@ -1010,26 +1077,17 @@ pub unsafe extern "C" fn create_tag(
             Some(cstr_to_str(color)?.to_string())
         };
 
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
 
         let tag = use_cases
             .create_tag(user_uuid, name_str.to_string(), color_str)
-            .map_err(|e| FfiResult::error(80, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TAG_CREATE, format!("{e}")))?;
 
-        let data = serde_json::to_value(&tag)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(tag)
+    })
 }
 
 /// List all tags for a user.
@@ -1038,28 +1096,18 @@ pub unsafe extern "C" fn create_tag(
 /// `user_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn list_tags(user_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
         let tags = use_cases
             .list_tags(user_uuid)
-            .map_err(|e| FfiResult::error(81, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TAG_LIST, format!("{e}")))?;
 
-        let data = serde_json::to_value(&tags)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(tags)
+    })
 }
 
 /// Update a tag's name and/or color.
@@ -1072,40 +1120,26 @@ pub unsafe extern "C" fn update_tag(
     tag_id: *const c_char,
     update_json: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let tag_id_str = cstr_to_str(tag_id)?;
         let json_str = cstr_to_str(update_json)?;
 
-        let tag_uuid = Uuid::parse_str(tag_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+        let tag_uuid = parse_uuid_ffi!(tag_id, "tag_id");
 
         let update: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| FfiResult::error(4, format!("Invalid JSON: {e}")))?;
+            .map_err(|e| FfiResult::error(ERR_SERIALIZATION, format!("Invalid JSON: {e}")))?;
 
         let name = update.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let color = if update.get("color").is_some() {
-            Some(update.get("color").unwrap().as_str().map(|s| s.to_string()))
-        } else {
-            None
-        };
+        let color = update.get("color").map(|v| v.as_str().map(|s| s.to_string()));
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
         let tag = use_cases
             .update_tag(tag_uuid, name, color)
-            .map_err(|e| FfiResult::error(82, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TAG_UPDATE, format!("{e}")))?;
 
-        let data = serde_json::to_value(&tag)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(tag)
+    })
 }
 
 /// Delete a tag and all its transaction associations.
@@ -1114,25 +1148,18 @@ pub unsafe extern "C" fn update_tag(
 /// `tag_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn delete_tag(tag_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let tag_id_str = cstr_to_str(tag_id)?;
-        let tag_uuid = Uuid::parse_str(tag_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+        let tag_uuid = parse_uuid_ffi!(tag_id, "tag_id");
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
         use_cases
             .delete_tag(tag_uuid)
-            .map_err(|e| FfiResult::error(83, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TAG_DELETE, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Add a tag to a transaction.
@@ -1144,29 +1171,19 @@ pub unsafe extern "C" fn add_tag_to_transaction(
     transaction_id: *const c_char,
     tag_id: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let tx_id_str = cstr_to_str(transaction_id)?;
-        let tag_id_str = cstr_to_str(tag_id)?;
-
-        let tx_uuid = Uuid::parse_str(tx_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
-        let tag_uuid = Uuid::parse_str(tag_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+        let tx_uuid = parse_uuid_ffi!(transaction_id, "transaction_id");
+        let tag_uuid = parse_uuid_ffi!(tag_id, "tag_id");
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
         use_cases
             .add_tag_to_transaction(tx_uuid, tag_uuid)
-            .map_err(|e| FfiResult::error(84, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TAG_ADD, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Remove a tag from a transaction.
@@ -1178,29 +1195,19 @@ pub unsafe extern "C" fn remove_tag_from_transaction(
     transaction_id: *const c_char,
     tag_id: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let tx_id_str = cstr_to_str(transaction_id)?;
-        let tag_id_str = cstr_to_str(tag_id)?;
-
-        let tx_uuid = Uuid::parse_str(tx_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
-        let tag_uuid = Uuid::parse_str(tag_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+        let tx_uuid = parse_uuid_ffi!(transaction_id, "transaction_id");
+        let tag_uuid = parse_uuid_ffi!(tag_id, "tag_id");
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
         use_cases
             .remove_tag_from_transaction(tx_uuid, tag_uuid)
-            .map_err(|e| FfiResult::error(85, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TAG_REMOVE, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// Get all tags attached to a transaction.
@@ -1209,58 +1216,44 @@ pub unsafe extern "C" fn remove_tag_from_transaction(
 /// `transaction_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn get_transaction_tags(transaction_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let tx_id_str = cstr_to_str(transaction_id)?;
-        let tx_uuid = Uuid::parse_str(tx_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
+        let tx_uuid = parse_uuid_ffi!(transaction_id, "transaction_id");
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
         let tags = use_cases
             .get_transaction_tags(tx_uuid)
-            .map_err(|e| FfiResult::error(86, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TAG_GET_TX, format!("{e}")))?;
 
-        let data = serde_json::to_value(&tags)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(tags)
+    })
 }
 
-/// Get all transaction IDs that have a given tag.
+/// Get paginated transaction IDs that have a given tag.
 ///
 /// # Safety
 /// `tag_id` must be a valid C string containing a UUID.
 #[no_mangle]
-pub unsafe extern "C" fn get_transactions_by_tag(tag_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+pub unsafe extern "C" fn get_transactions_by_tag(
+    tag_id: *const c_char,
+    limit: i64,
+    offset: i64,
+) -> *mut c_char {
+    ffi_body!({
         let db = get_db()?;
-        let tag_id_str = cstr_to_str(tag_id)?;
-        let tag_uuid = Uuid::parse_str(tag_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid tag_id UUID".to_string()))?;
+        let tag_uuid = parse_uuid_ffi!(tag_id, "tag_id");
+
+        let page = page_request!(limit, offset);
 
         let repo = SqliteTagRepository::new(db);
         let use_cases = TagUseCases::new(&repo);
-        let tx_ids = use_cases
-            .get_transactions_by_tag(tag_uuid)
-            .map_err(|e| FfiResult::error(87, format!("{e}")))?;
+        let paginated = use_cases
+            .get_transactions_by_tag_paginated(tag_uuid, &page)
+            .map_err(|e| FfiResult::error(ERR_TAG_BY_TAG, format!("{e}")))?;
 
-        let data = serde_json::to_value(&tx_ids)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(paginated)
+    })
 }
 
 // ─── Budget Progress (All) ──────────────────────────────────────────────────
@@ -1271,11 +1264,9 @@ pub unsafe extern "C" fn get_transactions_by_tag(tag_id: *const c_char) -> *mut 
 /// `account_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn get_all_budgets_progress(account_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
 
         let budget_repo = SqliteBudgetRepository::new(db);
         let transaction_repo = SqliteTransactionRepository::new(db);
@@ -1283,26 +1274,162 @@ pub unsafe extern "C" fn get_all_budgets_progress(account_id: *const c_char) -> 
 
         let budgets = use_cases
             .list_budgets(account_uuid)
-            .map_err(|e| FfiResult::error(51, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_BUDGET_LIST, format!("{e}")))?;
 
         let mut progress_list = Vec::new();
         for budget in &budgets {
             let progress = use_cases
                 .get_budget_progress(budget.base.id)
-                .map_err(|e| FfiResult::error(53, format!("{e}")))?;
+                .map_err(|e| FfiResult::error(ERR_BUDGET_PROGRESS, format!("{e}")))?;
             progress_list.push(progress);
         }
 
-        let data = serde_json::to_value(&progress_list)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
+        ok_json!(progress_list)
+    })
+}
+
+// ─── Spending Trends ─────────────────────────────────────────────────────────
+
+/// Get monthly trends for an account within a date range.
+///
+/// Returns JSON array of { year, month, income, expenses, net, transaction_count }.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn get_monthly_trends(
+    account_id: *const c_char,
+    from: *const c_char,
+    to: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let from_str = cstr_to_str(from)?;
+        let to_str = cstr_to_str(to)?;
+
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
+        let from_date = chrono::DateTime::parse_from_rfc3339(from_str)
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid from date (expected RFC3339)".to_string()))?
+            .with_timezone(&chrono::Utc);
+        let to_date = chrono::DateTime::parse_from_rfc3339(to_str)
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid to date (expected RFC3339)".to_string()))?
+            .with_timezone(&chrono::Utc);
+
+        let repo = SqliteTransactionRepository::new(db);
+        let use_cases = StatisticsUseCases::new(&repo);
+        let trends = use_cases
+            .get_monthly_trends(account_uuid, from_date, to_date)
+            .map_err(|e| FfiResult::error(ERR_MONTHLY_TRENDS, format!("{e}")))?;
+
+        ok_json!(trends)
+    })
+}
+
+/// Get daily spending for an account within a date range.
+///
+/// Returns JSON array of { date, amount, transaction_count }.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn get_daily_spending(
+    account_id: *const c_char,
+    from: *const c_char,
+    to: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let from_str = cstr_to_str(from)?;
+        let to_str = cstr_to_str(to)?;
+
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
+        let from_date = chrono::DateTime::parse_from_rfc3339(from_str)
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid from date (expected RFC3339)".to_string()))?
+            .with_timezone(&chrono::Utc);
+        let to_date = chrono::DateTime::parse_from_rfc3339(to_str)
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid to date (expected RFC3339)".to_string()))?
+            .with_timezone(&chrono::Utc);
+
+        let repo = SqliteTransactionRepository::new(db);
+        let use_cases = StatisticsUseCases::new(&repo);
+        let spending = use_cases
+            .get_daily_spending(account_uuid, from_date, to_date)
+            .map_err(|e| FfiResult::error(ERR_DAILY_SPENDING, format!("{e}")))?;
+
+        ok_json!(spending)
+    })
+}
+
+// ─── Transfer Linking ────────────────────────────────────────────────────────
+
+/// Create a transfer between two accounts.
+///
+/// Creates two linked transactions: an expense from the source account and an
+/// income to the destination account. Returns JSON with both transactions.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn create_transfer(
+    from_account_id: *const c_char,
+    to_account_id: *const c_char,
+    category_id: *const c_char,
+    amount: i64,
+    description: *const c_char,
+    date: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let desc_str = cstr_to_str(description)?;
+        let date_str = cstr_to_str(date)?;
+
+        let from_uuid = parse_uuid_ffi!(from_account_id, "from_account_id");
+        let to_uuid = parse_uuid_ffi!(to_account_id, "to_account_id");
+        let cat_uuid = parse_uuid_ffi!(category_id, "category_id");
+        let parsed_date = chrono::DateTime::parse_from_rfc3339(date_str)
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid date (expected RFC3339)".to_string()))?
+            .with_timezone(&chrono::Utc);
+
+        let repo = SqliteTransactionRepository::new(db);
+        let use_cases = TransactionUseCases::new(&repo);
+        let (outgoing, incoming) = use_cases
+            .create_transfer(from_uuid, to_uuid, cat_uuid, amount, desc_str.to_string(), parsed_date)
+            .map_err(|e| FfiResult::error(ERR_SEARCH, format!("{e}")))?;
+
+        let data = serde_json::json!({
+            "outgoing": serde_json::to_value(&outgoing)
+                .map_err(|e| FfiResult::error(ERR_SERIALIZATION, format!("Serialization error: {e}")))?,
+            "incoming": serde_json::to_value(&incoming)
+                .map_err(|e| FfiResult::error(ERR_SERIALIZATION, format!("Serialization error: {e}")))?,
+        });
 
         Ok(FfiResult::ok(data))
-    })();
+    })
+}
 
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+/// Get the linked transaction of a transfer.
+///
+/// Given one side of a transfer, returns the other side.
+///
+/// # Safety
+/// `transaction_id` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn get_linked_transaction(transaction_id: *const c_char) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let tx_uuid = parse_uuid_ffi!(transaction_id, "transaction_id");
+
+        let repo = SqliteTransactionRepository::new(db);
+        let use_cases = TransactionUseCases::new(&repo);
+        let linked = use_cases
+            .get_linked_transaction(tx_uuid)
+            .map_err(|e| FfiResult::error(ERR_LINKED_TX, format!("{e}")))?;
+
+        match linked {
+            Some(tx) => ok_json!(tx),
+            None => Ok(FfiResult::ok(serde_json::Value::Null)),
+        }
+    })
 }
 
 /// Free a string that was allocated by the FFI layer.
@@ -1327,7 +1454,7 @@ pub unsafe extern "C" fn create_user(
     name: *const c_char,
     email: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
         let name_str = cstr_to_str(name)?;
         let email_str = cstr_to_str(email)?;
@@ -1335,18 +1462,10 @@ pub unsafe extern "C" fn create_user(
         let user = User::new(name_str.to_string(), email_str.to_string());
         let repo = SqliteUserRepository::new(db);
         repo.save(&user)
-            .map_err(|e| FfiResult::error(24, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_USER, format!("{e}")))?;
 
-        let data = serde_json::to_value(&user)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(user)
+    })
 }
 
 /// Get a user by ID.
@@ -1355,28 +1474,18 @@ pub unsafe extern "C" fn create_user(
 /// `user_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn get_user(user_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteUserRepository::new(db);
         let user = repo
             .find_by_id(user_uuid)
-            .map_err(|e| FfiResult::error(24, format!("{e}")))?
-            .ok_or_else(|| FfiResult::error(24, "User not found".to_string()))?;
+            .map_err(|e| FfiResult::error(ERR_USER, format!("{e}")))?
+            .ok_or_else(|| FfiResult::error(ERR_USER, "User not found".to_string()))?;
 
-        let data = serde_json::to_value(&user)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(user)
+    })
 }
 
 // ─── Account List/Delete ─────────────────────────────────────────────────────
@@ -1387,28 +1496,18 @@ pub unsafe extern "C" fn get_user(user_id: *const c_char) -> *mut c_char {
 /// `user_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn list_accounts(user_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteAccountRepository::new(db);
         let use_cases = AccountUseCases::new(&repo);
         let accounts = use_cases
             .list_accounts(user_uuid)
-            .map_err(|e| FfiResult::error(20, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_ACCOUNT, format!("{e}")))?;
 
-        let data = serde_json::to_value(&accounts)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(accounts)
+    })
 }
 
 /// Soft-delete an account.
@@ -1417,25 +1516,70 @@ pub unsafe extern "C" fn list_accounts(user_id: *const c_char) -> *mut c_char {
 /// `account_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn delete_account(account_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
 
         let repo = SqliteAccountRepository::new(db);
         let use_cases = AccountUseCases::new(&repo);
         use_cases
             .delete_account(account_uuid)
-            .map_err(|e| FfiResult::error(20, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_ACCOUNT, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
+    })
+}
 
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+/// Get a single account by ID.
+///
+/// # Safety
+/// `account_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn get_account(account_id: *const c_char) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
+
+        let repo = SqliteAccountRepository::new(db);
+        let use_cases = AccountUseCases::new(&repo);
+        let account = use_cases
+            .get_account(account_uuid)
+            .map_err(|e| FfiResult::error(ERR_ACCOUNT, format!("{e}")))?;
+
+        ok_json!(account)
+    })
+}
+
+/// Update an account's name and/or currency.
+///
+/// Pass a JSON object with optional fields: `{"name": "...", "currency": "..."}`.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn update_account(
+    account_id: *const c_char,
+    update_json: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
+        let json_str = cstr_to_str(update_json)?;
+
+        let update: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| FfiResult::error(ERR_INVALID_INPUT, format!("Invalid JSON: {e}")))?;
+
+        let name = update.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let currency = update.get("currency").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        let repo = SqliteAccountRepository::new(db);
+        let use_cases = AccountUseCases::new(&repo);
+        let account = use_cases
+            .update_account(account_uuid, name, currency)
+            .map_err(|e| FfiResult::error(ERR_ACCOUNT, format!("{e}")))?;
+
+        ok_json!(account)
+    })
 }
 
 // ─── Category List/Delete ────────────────────────────────────────────────────
@@ -1446,28 +1590,18 @@ pub unsafe extern "C" fn delete_account(account_id: *const c_char) -> *mut c_cha
 /// `user_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn list_categories(user_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let user_id_str = cstr_to_str(user_id)?;
-        let user_uuid = Uuid::parse_str(user_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid user_id UUID".to_string()))?;
+        let user_uuid = parse_uuid_ffi!(user_id, "user_id");
 
         let repo = SqliteCategoryRepository::new(db);
         let use_cases = CategoryUseCases::new(&repo);
         let categories = use_cases
             .list_categories(user_uuid)
-            .map_err(|e| FfiResult::error(21, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_CATEGORY, format!("{e}")))?;
 
-        let data = serde_json::to_value(&categories)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(categories)
+    })
 }
 
 /// Soft-delete a category.
@@ -1476,25 +1610,76 @@ pub unsafe extern "C" fn list_categories(user_id: *const c_char) -> *mut c_char 
 /// `category_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn delete_category(category_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let category_id_str = cstr_to_str(category_id)?;
-        let category_uuid = Uuid::parse_str(category_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid category_id UUID".to_string()))?;
+        let category_uuid = parse_uuid_ffi!(category_id, "category_id");
 
         let repo = SqliteCategoryRepository::new(db);
         let use_cases = CategoryUseCases::new(&repo);
         use_cases
             .delete_category(category_uuid)
-            .map_err(|e| FfiResult::error(21, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_CATEGORY, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
+    })
+}
 
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+/// Get a single category by ID.
+///
+/// # Safety
+/// `category_id` must be a valid C string containing a UUID.
+#[no_mangle]
+pub unsafe extern "C" fn get_category(category_id: *const c_char) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let category_uuid = parse_uuid_ffi!(category_id, "category_id");
+
+        let repo = SqliteCategoryRepository::new(db);
+        let use_cases = CategoryUseCases::new(&repo);
+        let category = use_cases
+            .get_category(category_uuid)
+            .map_err(|e| FfiResult::error(ERR_CATEGORY, format!("{e}")))?;
+
+        ok_json!(category)
+    })
+}
+
+/// Update a category's name and/or icon.
+///
+/// Pass a JSON object with optional fields: `{"name": "...", "icon": "..."}`.
+/// Set `"icon": null` to remove the icon.
+///
+/// # Safety
+/// All pointer parameters must be valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn update_category(
+    category_id: *const c_char,
+    update_json: *const c_char,
+) -> *mut c_char {
+    ffi_body!({
+        let db = get_db()?;
+        let category_uuid = parse_uuid_ffi!(category_id, "category_id");
+        let json_str = cstr_to_str(update_json)?;
+
+        let update: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| FfiResult::error(ERR_INVALID_INPUT, format!("Invalid JSON: {e}")))?;
+
+        let name = update.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        // icon: if key exists, update it (null → None, string → Some)
+        let icon = if update.get("icon").is_some() {
+            Some(update["icon"].as_str().map(|s| s.to_string()))
+        } else {
+            None
+        };
+
+        let repo = SqliteCategoryRepository::new(db);
+        let use_cases = CategoryUseCases::new(&repo);
+        let category = use_cases
+            .update_category(category_uuid, name, icon)
+            .map_err(|e| FfiResult::error(ERR_CATEGORY, format!("{e}")))?;
+
+        ok_json!(category)
+    })
 }
 
 // ─── Transaction Edit/Delete/List ────────────────────────────────────────────
@@ -1512,22 +1697,18 @@ pub unsafe extern "C" fn edit_transaction(
     category_id: *const c_char,
     date: *const c_char,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let tx_id_str = cstr_to_str(transaction_id)?;
         let type_str = cstr_to_str(transaction_type)?;
         let desc_str = cstr_to_str(description)?;
-        let cat_id_str = cstr_to_str(category_id)?;
         let date_str = cstr_to_str(date)?;
 
-        let tx_uuid = Uuid::parse_str(tx_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
-        let cat_uuid = Uuid::parse_str(cat_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid category_id UUID".to_string()))?;
+        let tx_uuid = parse_uuid_ffi!(transaction_id, "transaction_id");
+        let cat_uuid = parse_uuid_ffi!(category_id, "category_id");
         let tx_type = TransactionType::from_str(type_str)
-            .ok_or_else(|| FfiResult::error(3, "Invalid transaction_type".to_string()))?;
+            .ok_or_else(|| FfiResult::error(ERR_INVALID_INPUT, "Invalid transaction_type".to_string()))?;
         let parsed_date = chrono::DateTime::parse_from_rfc3339(date_str)
-            .map_err(|_| FfiResult::error(3, "Invalid date format (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid date format (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
 
         let repo = SqliteTransactionRepository::new(db);
@@ -1535,18 +1716,10 @@ pub unsafe extern "C" fn edit_transaction(
 
         let transaction = use_cases
             .edit_transaction(tx_uuid, amount, tx_type, desc_str.to_string(), cat_uuid, parsed_date)
-            .map_err(|e| FfiResult::error(22, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TRANSACTION, format!("{e}")))?;
 
-        let data = serde_json::to_value(&transaction)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(transaction)
+    })
 }
 
 /// Soft-delete a transaction.
@@ -1555,55 +1728,46 @@ pub unsafe extern "C" fn edit_transaction(
 /// `transaction_id` must be a valid C string containing a UUID.
 #[no_mangle]
 pub unsafe extern "C" fn delete_transaction(transaction_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let tx_id_str = cstr_to_str(transaction_id)?;
-        let tx_uuid = Uuid::parse_str(tx_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid transaction_id UUID".to_string()))?;
+        let tx_uuid = parse_uuid_ffi!(transaction_id, "transaction_id");
 
         let repo = SqliteTransactionRepository::new(db);
         let use_cases = TransactionUseCases::new(&repo);
         use_cases
             .delete_transaction(tx_uuid)
-            .map_err(|e| FfiResult::error(22, format!("{e}")))?;
+            .map_err(|e| FfiResult::error(ERR_TRANSACTION, format!("{e}")))?;
 
         Ok(FfiResult::ok_empty())
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+    })
 }
 
 /// List transactions for an account.
 ///
+/// Returns a paginated result with `items`, `total_count`, and `has_more`.
+///
 /// # Safety
 /// `account_id` must be a valid C string containing a UUID.
 #[no_mangle]
-pub unsafe extern "C" fn list_transactions(account_id: *const c_char) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+pub unsafe extern "C" fn list_transactions(
+    account_id: *const c_char,
+    limit: i64,
+    offset: i64,
+) -> *mut c_char {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
+
+        let page = page_request!(limit, offset);
 
         let repo = SqliteTransactionRepository::new(db);
         let use_cases = TransactionUseCases::new(&repo);
-        let transactions = use_cases
-            .list_transactions(account_uuid)
-            .map_err(|e| FfiResult::error(22, format!("{e}")))?;
+        let paginated = use_cases
+            .list_transactions_paginated(account_uuid, &page)
+            .map_err(|e| FfiResult::error(ERR_TRANSACTION, format!("{e}")))?;
 
-        let data = serde_json::to_value(&transactions)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(paginated)
+    })
 }
 
 /// List transactions for an account within a date range.
@@ -1615,36 +1779,30 @@ pub unsafe extern "C" fn list_transactions_by_date_range(
     account_id: *const c_char,
     from: *const c_char,
     to: *const c_char,
+    limit: i64,
+    offset: i64,
 ) -> *mut c_char {
-    let result = (|| -> Result<FfiResult, FfiResult> {
+    ffi_body!({
         let db = get_db()?;
-        let account_id_str = cstr_to_str(account_id)?;
         let from_str = cstr_to_str(from)?;
         let to_str = cstr_to_str(to)?;
 
-        let account_uuid = Uuid::parse_str(account_id_str)
-            .map_err(|_| FfiResult::error(3, "Invalid account_id UUID".to_string()))?;
+        let account_uuid = parse_uuid_ffi!(account_id, "account_id");
         let from_date = chrono::DateTime::parse_from_rfc3339(from_str)
-            .map_err(|_| FfiResult::error(3, "Invalid from date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid from date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
         let to_date = chrono::DateTime::parse_from_rfc3339(to_str)
-            .map_err(|_| FfiResult::error(3, "Invalid to date (expected RFC3339)".to_string()))?
+            .map_err(|_| FfiResult::error(ERR_INVALID_INPUT, "Invalid to date (expected RFC3339)".to_string()))?
             .with_timezone(&chrono::Utc);
+
+        let page = page_request!(limit, offset);
 
         let repo = SqliteTransactionRepository::new(db);
         let use_cases = TransactionUseCases::new(&repo);
-        let transactions = use_cases
-            .list_transactions_by_date_range(account_uuid, from_date, to_date)
-            .map_err(|e| FfiResult::error(22, format!("{e}")))?;
+        let paginated = use_cases
+            .list_transactions_by_date_range_paginated(account_uuid, from_date, to_date, &page)
+            .map_err(|e| FfiResult::error(ERR_TRANSACTION, format!("{e}")))?;
 
-        let data = serde_json::to_value(&transactions)
-            .map_err(|e| FfiResult::error(4, format!("Serialization error: {e}")))?;
-
-        Ok(FfiResult::ok(data))
-    })();
-
-    match result {
-        Ok(r) => r.to_json_cstring(),
-        Err(r) => r.to_json_cstring(),
-    }
+        ok_json!(paginated)
+    })
 }

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::entities::{Budget, BudgetPeriod, BudgetProgress, TransactionType};
+use crate::entities::{Budget, BudgetPeriod, BudgetProgress};
 use crate::errors::DomainError;
 use crate::repositories::{BudgetRepository, TransactionRepository};
 
@@ -67,30 +67,13 @@ impl<'a> BudgetUseCases<'a> {
         let period_end = budget.period_end_date();
         let period_start = budget.start_date;
 
-        // Get transactions for the budget period
-        let transactions = self
-            .transaction_repo
-            .find_by_date_range(budget.account_id, period_start, period_end)?;
-
-        // Calculate total spending
-        let mut spent = 0i64;
-        for tx in transactions {
-            if tx.base.is_deleted() {
-                continue;
-            }
-
-            // Filter by category if budget is category-specific
-            if let Some(cat_id) = budget.category_id {
-                if tx.category_id != cat_id {
-                    continue;
-                }
-            }
-
-            // Only count expenses
-            if tx.transaction_type == TransactionType::Expense {
-                spent += tx.amount;
-            }
-        }
+        // SQL SUM instead of loading all transactions into memory
+        let spent = self.transaction_repo.get_budget_spent(
+            budget.account_id,
+            budget.category_id,
+            period_start,
+            period_end,
+        )?;
 
         let remaining = budget.amount - spent;
         let percentage = if budget.amount > 0 {

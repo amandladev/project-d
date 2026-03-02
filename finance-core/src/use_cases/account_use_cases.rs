@@ -57,4 +57,38 @@ impl<'a> AccountUseCases<'a> {
         account.version += 1;
         self.repo.update(&account)
     }
+
+    /// Update an account's name and/or currency.
+    pub fn update_account(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        currency: Option<String>,
+    ) -> Result<Account, DomainError> {
+        let mut account = self.get_account(id)?;
+
+        if let Some(n) = name {
+            if n.trim().is_empty() {
+                return Err(DomainError::Validation(
+                    "Account name cannot be empty".to_string(),
+                ));
+            }
+            account.name = n;
+        }
+
+        if let Some(c) = currency {
+            if c.trim().is_empty() {
+                return Err(DomainError::Validation(
+                    "Currency cannot be empty".to_string(),
+                ));
+            }
+            account.currency = c;
+        }
+
+        account.base.touch();
+        account.sync_status = crate::entities::SyncStatus::Pending;
+        account.version += 1;
+        self.repo.update(&account)?;
+        Ok(account)
+    }
 }

@@ -230,6 +230,14 @@ impl TransactionRepository for InMemoryTransactionRepository {
             .collect())
     }
 
+    fn find_by_account_id_paginated(
+        &self,
+        _account_id: Uuid,
+        _page: &finance_core::entities::pagination::PageRequest,
+    ) -> Result<finance_core::entities::pagination::PaginatedResult<Transaction>, DomainError> {
+        Ok(finance_core::entities::pagination::PaginatedResult { items: Vec::new(), total_count: 0, has_more: false })
+    }
+
     fn find_by_date_range(
         &self,
         account_id: Uuid,
@@ -249,6 +257,16 @@ impl TransactionRepository for InMemoryTransactionRepository {
             })
             .cloned()
             .collect())
+    }
+
+    fn find_by_date_range_paginated(
+        &self,
+        _account_id: Uuid,
+        _from: chrono::DateTime<Utc>,
+        _to: chrono::DateTime<Utc>,
+        _page: &finance_core::entities::pagination::PageRequest,
+    ) -> Result<finance_core::entities::pagination::PaginatedResult<Transaction>, DomainError> {
+        Ok(finance_core::entities::pagination::PaginatedResult { items: Vec::new(), total_count: 0, has_more: false })
     }
 
     fn update(&self, transaction: &Transaction) -> Result<(), DomainError> {
@@ -305,9 +323,48 @@ impl TransactionRepository for InMemoryTransactionRepository {
     fn search(
         &self,
         _filter: &TransactionSearchFilter,
-    ) -> Result<Vec<Transaction>, DomainError> {
+    ) -> Result<finance_core::entities::pagination::PaginatedResult<Transaction>, DomainError> {
         // Mock implementation - not needed for sync tests
+        Ok(finance_core::entities::pagination::PaginatedResult { items: Vec::new(), total_count: 0, has_more: false })
+    }
+
+    fn get_income_vs_expenses(
+        &self,
+        _account_id: Uuid,
+        _from: DateTime<Utc>,
+        _to: DateTime<Utc>,
+    ) -> Result<finance_core::use_cases::statistics_use_cases::IncomeSummary, DomainError> {
+        Ok(finance_core::use_cases::statistics_use_cases::IncomeSummary {
+            income: 0, expenses: 0, transfers: 0, net: 0,
+        })
+    }
+
+    fn get_monthly_trends(
+        &self,
+        _account_id: Uuid,
+        _from: DateTime<Utc>,
+        _to: DateTime<Utc>,
+    ) -> Result<Vec<finance_core::use_cases::statistics_use_cases::MonthlyTrend>, DomainError> {
         Ok(Vec::new())
+    }
+
+    fn get_daily_spending(
+        &self,
+        _account_id: Uuid,
+        _from: DateTime<Utc>,
+        _to: DateTime<Utc>,
+    ) -> Result<Vec<finance_core::use_cases::statistics_use_cases::DailySpending>, DomainError> {
+        Ok(Vec::new())
+    }
+
+    fn get_budget_spent(
+        &self,
+        _account_id: Uuid,
+        _category_id: Option<Uuid>,
+        _from: DateTime<Utc>,
+        _to: DateTime<Utc>,
+    ) -> Result<i64, DomainError> {
+        Ok(0)
     }
 }
 

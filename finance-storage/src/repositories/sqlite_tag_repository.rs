@@ -1,14 +1,15 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::params;
 use uuid::Uuid;
 
 use finance_core::entities::common::BaseEntity;
+use finance_core::entities::pagination::{PageRequest, PaginatedResult};
 use finance_core::entities::Tag;
 use finance_core::errors::DomainError;
 use finance_core::repositories::TagRepository;
 
 use crate::database::Database;
-use crate::date_utils::{format_dt, format_dt_opt};
+use crate::date_utils::{format_dt, format_dt_opt, parse_dt, parse_dt_opt, parse_uuid};
 use crate::error::StorageError;
 
 /// SQLite implementation of TagRepository.
@@ -53,7 +54,7 @@ impl<'a> TagRepository for SqliteTagRepository<'a> {
 
         let result = stmt
             .query_row(params![id.to_string()], |row| {
-                Ok(row_to_tag(row))
+                row_to_tag(row)
             })
             .optional()
             .map_err(|e| DomainError::Storage(StorageError::Query(e.to_string()).to_string()))?;
@@ -75,7 +76,7 @@ impl<'a> TagRepository for SqliteTagRepository<'a> {
 
         let rows = stmt
             .query_map(params![user_id.to_string()], |row| {
-                Ok(row_to_tag(row))
+                row_to_tag(row)
             })
             .map_err(|e| DomainError::Storage(StorageError::Query(e.to_string()).to_string()))?;
 
@@ -167,7 +168,7 @@ impl<'a> TagRepository for SqliteTagRepository<'a> {
 
         let rows = stmt
             .query_map(params![transaction_id.to_string()], |row| {
-                Ok(row_to_tag(row))
+                row_to_tag(row)
             })
             .map_err(|e| DomainError::Storage(StorageError::Query(e.to_string()).to_string()))?;
 
@@ -207,29 +208,71 @@ impl<'a> TagRepository for SqliteTagRepository<'a> {
         }
         Ok(ids)
     }
+
+    fn find_transaction_ids_by_tag_paginated(
+        &self,
+        tag_id: Uuid,
+        page: &PageRequest,
+    ) -> Result<PaginatedResult<Uuid>, DomainError> {
+        let conn = self.db.conn.lock().unwrap();
+
+        let total_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transaction_tags WHERE tag_id = ?1",
+                params![tag_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| DomainError::Storage(StorageError::Query(e.to_string()).to_string()))?;
+
+        let mut stmt = conn
+            .prepare("SELECT transaction_id FROM transaction_tags WHERE tag_id = ?1 LIMIT ?2 OFFSET ?3")
+            .map_err(|e| DomainError::Storage(StorageError::Query(e.to_string()).to_string()))?;
+
+        let rows = stmt
+            .query_map(
+                params![tag_id.to_string(), page.limit as i64, page.offset as i64],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    Ok(id_str)
+                },
+            )
+            .map_err(|e| DomainError::Storage(StorageError::Query(e.to_string()).to_string()))?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            let id_str = row
+                .map_err(|e| {
+                    DomainError::Storage(StorageError::Query(e.to_string()).to_string())
+                })?;
+            let uuid = Uuid::parse_str(&id_str)
+                .map_err(|e| DomainError::Storage(format!("Invalid UUID: {e}")))?;
+            ids.push(uuid);
+        }
+        Ok(PaginatedResult::from_vec(ids, total_count, page))
+    }
 }
 
 /// Convert a row to a Tag.
-fn row_to_tag(row: &rusqlite::Row) -> Tag {
-    let id_str: String = row.get(0).unwrap();
-    let user_id_str: String = row.get(1).unwrap();
-    let name: String = row.get(2).unwrap();
-    let color: Option<String> = row.get(3).unwrap();
-    let created_at: String = row.get(4).unwrap();
-    let updated_at: String = row.get(5).unwrap();
-    let deleted_at: Option<String> = row.get(6).unwrap();
+fn row_to_tag(row: &rusqlite::Row) -> rusqlite::Result<Tag> {
+    let id_str: String = row.get(0)?;
+    let user_id_str: String = row.get(1)?;
+    let name: String = row.get(2)?;
+    let color: Option<String> = row.get(3)?;
+    let created_str: String = row.get(4)?;
+    let updated_str: String = row.get(5)?;
+    let deleted_str: Option<String> = row.get(6)?;
 
-    Tag {
+    Ok(Tag {
         base: BaseEntity {
-            id: Uuid::parse_str(&id_str).unwrap(),
-            created_at: created_at.parse::<DateTime<Utc>>().unwrap(),
-            updated_at: updated_at.parse::<DateTime<Utc>>().unwrap(),
-            deleted_at: deleted_at.map(|d| d.parse::<DateTime<Utc>>().unwrap()),
+            id: parse_uuid(&id_str)?,
+            created_at: parse_dt(&created_str)?,
+            updated_at: parse_dt(&updated_str)?,
+            deleted_at: parse_dt_opt(deleted_str)?,
         },
-        user_id: Uuid::parse_str(&user_id_str).unwrap(),
+        user_id: parse_uuid(&user_id_str)?,
         name,
         color,
-    }
+    })
 }
 
 use rusqlite::OptionalExtension;

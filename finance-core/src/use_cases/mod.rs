@@ -14,6 +14,6 @@ pub use category_use_cases::CategoryUseCases;
 pub use currency_use_cases::{CurrencyUseCases, RateFreshness};
 pub use recurring_transaction_use_cases::RecurringTransactionUseCases;
 pub use search_use_cases::SearchUseCases;
-pub use statistics_use_cases::{CategorySpending, IncomeSummary, StatisticsUseCases};
+pub use statistics_use_cases::{CategorySpending, DailySpending, IncomeSummary, MonthlyTrend, StatisticsUseCases};
 pub use tag_use_cases::TagUseCases;
 pub use transaction_use_cases::TransactionUseCases;
